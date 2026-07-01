@@ -3,9 +3,30 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// --- DEFAULT SUPABASE CONFIGURATION (override via Admin Panel → Database Config) ---
-const DEFAULT_SUPABASE_URL = 'https://gwepnwrdoyfgjvdwuypa.supabase.co';
-const DEFAULT_SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3ZXBud3Jkb3lmZ2p2ZHd1eXBhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDc5NjM5MDcsImV4cCI6MjA2MzUzOTkwN30.phqJIn3NwRq_VHp2g47jB6AWH3mRq9Bx4V2r3d6rHC4';
+// --- SUPABASE CONFIGURATION (auto-switches between dev & production) ---
+// Local testing (file://, localhost) → Dev database
+// Deployed (GitHub Pages, custom domain) → Production database
+const SUPABASE_CONFIG = {
+  dev: {
+    url: 'https://ixlpwptcyunnradsdyfn.supabase.co',
+    key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml4bHB3cHRjeXVubnJhZHNkeWZuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI4MDU2OTMsImV4cCI6MjA5ODM4MTY5M30.MebT_StSZb486NlN1HqLPS2y3e7GWC9e_Vx9olvSKZ4'
+  },
+  production: {
+    url: 'https://gwepnwrdoyfgjvdwuypa.supabase.co',
+    key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3ZXBud3Jkb3lmZ2p2ZHd1eXBhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDc5NjM5MDcsImV4cCI6MjA2MzUzOTkwN30.phqJIn3NwRq_VHp2g47jB6AWH3mRq9Bx4V2r3d6rHC4'
+  }
+};
+
+function detectEnvironment() {
+  var host = window.location.hostname;
+  if (!host || host === 'localhost' || host === '127.0.0.1' || host === '') return 'dev';
+  return 'production';
+}
+
+var ENV = detectEnvironment();
+var DEFAULT_SUPABASE_URL = SUPABASE_CONFIG[ENV].url;
+var DEFAULT_SUPABASE_KEY = SUPABASE_CONFIG[ENV].key;
+console.log('KCTC Environment: ' + ENV.toUpperCase() + ' — Supabase: ' + DEFAULT_SUPABASE_URL);
 
 // --- STATIC DATA ---
 const CREATIONS = [
@@ -69,6 +90,15 @@ function generateUUID() {
     const v = c === 'x' ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
+}
+
+function generateRollNumber() {
+  const year = new Date().getFullYear();
+  const key = 'KCTC_ROLL_COUNTER_' + year;
+  let counter = parseInt(localStorage.getItem(key) || '0');
+  counter++;
+  localStorage.setItem(key, String(counter));
+  return 'KCTC-' + year + '-' + String(counter).padStart(3, '0');
 }
 
 // --- CORE SYSTEM INITIALIZER ---
@@ -940,6 +970,7 @@ async function handleStudentRegister(e) {
 
   const newStd = {
     id: generateUUID(),
+    roll_number: generateRollNumber(),
     full_name: name,
     father_name: father,
     dob: dob,
@@ -952,6 +983,8 @@ async function handleStudentRegister(e) {
     enrolled_course: document.getElementById('reg-course').value,
     fees_paid: false,
     fees_amount: 4500,
+    due_date: null,
+    payments: [],
     email_verified: false,
     enrollment_status: 'pending',
     documents: {},
@@ -1250,6 +1283,11 @@ function setAdminTab(tabId) {
     document.getElementById('db-config-url').value = state.supabaseUrl;
     document.getElementById('db-config-key').value = state.supabaseKey;
     document.getElementById('db-test-result').classList.add('hidden');
+    var badge = document.getElementById('db-env-badge');
+    if (badge) {
+      badge.innerText = ENV === 'dev' ? 'DEV MODE — Test Database' : 'LIVE — Production Database';
+      badge.className = 'inline-block mt-2 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider ' + (ENV === 'dev' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20');
+    }
   }
 
   if (typeof lucide !== 'undefined') { lucide.createIcons(); }
@@ -1261,6 +1299,7 @@ function updateAnalyticsDashboard() {
   const total = state.students.length;
   const active = state.students.filter(s => s.enrollment_status === 'accepted').length;
   const revenue = state.students.reduce((acc, s) => acc + (s.fees_paid ? s.fees_amount : 0), 0);
+  const totalCollected = state.students.reduce((acc, s) => acc + (s.payments || []).reduce((s2, p) => s2 + (p.amount || 0), 0), 0);
   const unpaidCount = state.students.filter(s => !s.fees_paid).length;
 
   document.getElementById('stat-total-students').innerText = total;
@@ -1370,6 +1409,9 @@ function renderStudentsTable() {
                         'bg-amber-500/10 text-amber-400 border border-amber-500/20';
 
     const feesClass = s.fees_paid ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400';
+    const totalPaid = (s.payments || []).reduce((sum, p) => sum + (p.amount || 0), 0);
+    const dueDateStr = s.due_date ? new Date(s.due_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : null;
+    const isOverdue = s.due_date && !s.fees_paid && new Date(s.due_date) < new Date();
 
     const docCount = s.documents ? Object.keys(s.documents).filter(k => k !== 'selfDeclaration' && s.documents[k] && s.documents[k].dataUrl).length : 0;
 
@@ -1378,7 +1420,8 @@ function renderStudentsTable() {
     tr.innerHTML = `
       <td class="p-3.5">
         <strong class="block text-white font-serif text-sm">${s.full_name}</strong>
-        <span class="text-[10px] text-slate-500 font-bold uppercase mt-1 block">Father: ${s.father_name}</span>
+        <span class="text-[10px] text-slate-500 font-bold uppercase mt-1 block">${s.roll_number || '—'}</span>
+        <span class="text-[9px] text-slate-600 block">Father: ${s.father_name}</span>
       </td>
       <td class="p-3.5">
         <span class="block font-medium text-slate-300">${s.phone}</span>
@@ -1388,11 +1431,15 @@ function renderStudentsTable() {
         ${s.enrolled_course.replace(" Course", "")}
       </td>
       <td class="p-3.5">
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2 flex-wrap">
           <span class="px-2.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider ${statusClass}">${s.enrollment_status.toUpperCase()}</span>
           <span class="px-2.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider ${feesClass}">₹${s.fees_amount} ${s.fees_paid ? 'PAID' : 'UNPAID'}</span>
+          ${dueDateStr ? `<span class="text-[9px] font-bold ${isOverdue ? 'text-red-400' : 'text-slate-500'}">Due: ${dueDateStr}</span>` : ''}
         </div>
-        <span class="font-mono text-[10px] text-[#c5a059] mt-1.5 block">Pass: ${s.password || 'password123'}</span>
+        <div class="flex items-center gap-1 mt-1.5">
+          <span class="font-mono text-[10px] text-[#c5a059]">Pass: ${s.password || 'password123'}</span>
+          <button onclick="adminOpenPaymentHistory('${s.id}')" class="ml-2 px-2 py-0.5 bg-slate-800 hover:bg-emerald-800 rounded text-[9px] text-slate-300 font-bold transition-all">₹ Payments</button>
+        </div>
       </td>
       <td class="p-3.5">
         <button onclick="adminPreviewDocs('${s.id}')" class="px-2.5 py-1.5 bg-slate-900 hover:bg-[#501537] rounded-lg text-slate-400 hover:text-white text-[10px] font-bold transition-all border border-slate-800 flex items-center gap-1.5">
@@ -1644,6 +1691,135 @@ async function adminSaveRemark(studentId) {
   renderStudentsTable();
 }
 
+function adminOpenPaymentHistory(studentId) {
+  const student = state.students.find(s => s.id === studentId);
+  if (!student) return;
+  const payments = student.payments || [];
+  const totalPaid = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+  const due = student.fees_amount - totalPaid;
+
+  const overlay = document.createElement('div');
+  overlay.id = 'admin-payment-overlay';
+  overlay.className = 'fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4';
+  overlay.onclick = function(e) { if (e.target === overlay) overlay.remove(); };
+
+  var rows = payments.length === 0 ? '<p class="text-slate-500 text-xs text-center py-4">No payments recorded yet.</p>' :
+    payments.map(function(p, i) {
+      var dateStr = new Date(p.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+      return '<div class="flex items-center justify-between bg-slate-900 p-3 rounded-xl border border-slate-800"><div><span class="text-emerald-400 font-bold text-sm">₹' + p.amount + '</span><span class="text-slate-500 text-[10px] ml-2">' + dateStr + '</span></div><div class="text-right"><span class="text-slate-300 text-[10px] font-bold uppercase">' + (p.method || 'Cash') + '</span>' + (p.note ? '<span class="text-slate-500 text-[9px] block">' + p.note + '</span>' : '') + '</div></div>';
+    }).join('');
+
+  overlay.innerHTML = `
+    <div class="bg-slate-950 rounded-3xl w-full max-w-lg border border-slate-800 shadow-2xl relative flex flex-col animate-fade-in" onclick="event.stopPropagation()">
+      <button onclick="document.getElementById('admin-payment-overlay').remove()" class="absolute right-4 top-4 text-slate-500 hover:text-slate-300 p-1">
+        <i data-lucide="x" class="w-5 h-5"></i>
+      </button>
+      <div class="p-6 border-b border-slate-800">
+        <h2 class="text-lg font-black text-white flex items-center gap-2">
+          <i data-lucide="indian-rupee" class="w-5 h-5 text-emerald-400"></i>
+          <span>Payment History — ${student.full_name}</span>
+        </h2>
+        <p class="text-xs text-slate-400 mt-1">Roll: ${student.roll_number || '—'} | Total Fee: ₹${student.fees_amount} | Paid: ₹${totalPaid} | Due: ₹${Math.max(0, due)}</p>
+      </div>
+      <div class="p-6 flex flex-col gap-3 max-h-[350px] overflow-y-auto">${rows}</div>
+      <div class="p-4 border-t border-slate-800 flex gap-2">
+        <input type="number" id="payment-amount-input" placeholder="Amount" class="w-28 px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-emerald-500">
+        <input type="date" id="payment-date-input" class="px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-emerald-500">
+        <select id="payment-method-input" class="px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-200 outline-none">
+          <option value="Cash">Cash</option>
+          <option value="UPI">UPI</option>
+          <option value="Bank Transfer">Bank Transfer</option>
+        </select>
+        <input type="text" id="payment-note-input" placeholder="Note" class="flex-grow px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-emerald-500">
+        <button onclick="adminAddPayment('${studentId}')" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl transition-all">Add</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  if (typeof lucide !== 'undefined') lucide.createIcons();
+}
+
+function adminAddPayment(studentId) {
+  const student = state.students.find(s => s.id === studentId);
+  if (!student) return;
+  const amount = parseInt(document.getElementById('payment-amount-input').value);
+  if (!amount || amount <= 0) { alert('Enter a valid amount.'); return; }
+  const date = document.getElementById('payment-date-input').value || new Date().toISOString().split('T')[0];
+  const method = document.getElementById('payment-method-input').value;
+  const note = document.getElementById('payment-note-input').value.trim();
+  if (!student.payments) student.payments = [];
+  student.payments.push({ amount: amount, date: date, method: method, note: note });
+  const totalPaid = student.payments.reduce((s, p) => s + p.amount, 0);
+  student.fees_paid = totalPaid >= student.fees_amount;
+  student.fees_amount = Math.max(student.fees_amount, totalPaid);
+  saveStateToLocalStorage();
+  if (state.supabaseClient) {
+    state.supabaseClient.from('admin_students').upsert([student]).then(function(r) { if (r.error) console.error(r.error); });
+  }
+  renderStudentsTable();
+  updateAnalyticsDashboard();
+  adminOpenPaymentHistory(studentId);
+}
+
+function downloadCSV(filename, headers, rows) {
+  var csv = headers.join(',') + '\n';
+  rows.forEach(function(row) {
+    var escaped = row.map(function(cell) {
+      var str = String(cell != null ? cell : '');
+      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+        return '"' + str.replace(/"/g, '""') + '"';
+      }
+      return str;
+    });
+    csv += escaped.join(',') + '\n';
+  });
+  var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  var link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+function exportStudentsCSV() {
+  var headers = ['Roll Number', 'Full Name', 'Father Name', 'Phone', 'Email', 'Course', 'Fees Amount', 'Fees Paid', 'Due Date', 'Total Paid', 'Enrollment Status', 'Created At'];
+  var rows = state.students.map(function(s) {
+    var totalPaid = (s.payments || []).reduce(function(sum, p) { return sum + (p.amount || 0); }, 0);
+    return [
+      s.roll_number || '', s.full_name, s.father_name, s.phone, s.email,
+      s.enrolled_course, s.fees_amount, s.fees_paid ? 'Yes' : 'No',
+      s.due_date || '', totalPaid, s.enrollment_status, s.created_at
+    ];
+  });
+  downloadCSV('KCTC_Students_' + new Date().toISOString().split('T')[0] + '.csv', headers, rows);
+}
+
+function exportCertificatesCSV() {
+  var headers = ['Student Name', 'Father Name', 'Roll Number', 'Course', 'Grade', 'Passing Year', 'Verification Code', 'Created At'];
+  var rows = state.certificates.map(function(c) {
+    return [c.student_name, c.father_name || '', c.roll_number, c.course_name, c.grade, c.passing_year, c.verification_code, c.created_at];
+  });
+  downloadCSV('KCTC_Certificates_' + new Date().toISOString().split('T')[0] + '.csv', headers, rows);
+}
+
+function exportAnalyticsCSV() {
+  var headers = ['Metric', 'Value'];
+  var total = state.students.length;
+  var active = state.students.filter(function(s) { return s.enrollment_status === 'accepted'; }).length;
+  var revenue = state.students.reduce(function(acc, s) { return acc + (s.fees_paid ? s.fees_amount : 0); }, 0);
+  var unpaidCount = state.students.filter(function(s) { return !s.fees_paid; }).length;
+  var totalPaidAll = state.students.reduce(function(acc, s) { return acc + (s.payments || []).reduce(function(s2, p) { return s2 + (p.amount || 0); }, 0); }, 0);
+  var rows = [
+    ['Total Enrolled', total],
+    ['Active Accounts', active],
+    ['Tailor Fees Paid', '₹' + revenue],
+    ['Total Collected (all payments)', '₹' + totalPaidAll],
+    ['Pending Fees Count', unpaidCount],
+    ['Pending Fees Value', '₹' + state.students.filter(function(s) { return !s.fees_paid; }).reduce(function(acc, s) { return acc + (s.fees_amount || 0) - ((s.payments || []).reduce(function(s2, p) { return s2 + (p.amount || 0); }, 0)); }, 0)]
+  ];
+  downloadCSV('KCTC_Analytics_' + new Date().toISOString().split('T')[0] + '.csv', headers, rows);
+}
+
 // --- ADD/EDIT STUDENTS FORM WORK ---
 function openAddStudentModal() {
   document.getElementById('add-student-modal').classList.remove('hidden');
@@ -1688,6 +1864,7 @@ async function handleAdminAddStudentSubmit(e) {
 
   const newStd = {
     id: generateUUID(),
+    roll_number: generateRollNumber(),
     full_name: name,
     father_name: father,
     dob: dob || null,
@@ -1700,6 +1877,8 @@ async function handleAdminAddStudentSubmit(e) {
     enrolled_course: document.getElementById('add-student-course').value,
     fees_paid: paid,
     fees_amount: fees,
+    due_date: document.getElementById('add-student-due-date').value || null,
+    payments: [],
     email_verified: false,
     enrollment_status: status,
     documents: {},
@@ -1759,6 +1938,7 @@ function openEditStudentModal(id) {
   document.getElementById('edit-student-fees').value = s.fees_amount;
   document.getElementById('edit-student-status').value = s.enrollment_status || 'accepted';
   document.getElementById('edit-student-paid').checked = s.fees_paid;
+  document.getElementById('edit-student-due-date').value = s.due_date || '';
 
   document.getElementById('edit-student-modal').classList.remove('hidden');
 }
@@ -1788,6 +1968,7 @@ async function handleAdminEditStudentSubmit(e) {
     enrolled_course: document.getElementById('edit-student-course').value,
     fees_paid: document.getElementById('edit-student-paid').checked,
     fees_amount: parseInt(document.getElementById('edit-student-fees').value) || 4500,
+    due_date: document.getElementById('edit-student-due-date').value || null,
     enrollment_status: document.getElementById('edit-student-status').value,
     created_at: new Date().toISOString()
   };
@@ -2158,6 +2339,20 @@ async function saveSupabaseConfiguration() {
   updateAnalyticsDashboard();
 
   alert("Supabase active configuration saved! Live synchronized cloud database is running.");
+}
+
+function resetSupabaseToDefaults() {
+  if (!confirm("Reset Supabase credentials to environment defaults? This clears your saved override.")) return;
+  localStorage.removeItem('KCTC_SUPABASE_URL');
+  localStorage.removeItem('KCTC_SUPABASE_KEY');
+  state.supabaseUrl = DEFAULT_SUPABASE_URL;
+  state.supabaseKey = DEFAULT_SUPABASE_KEY;
+  initSupabaseClient();
+  updateDatabaseStatusIndicators();
+  document.getElementById('db-config-url').value = state.supabaseUrl;
+  document.getElementById('db-config-key').value = state.supabaseKey;
+  document.getElementById('db-test-result').classList.add('hidden');
+  alert("Reset to " + ENV.toUpperCase() + " defaults. Using: " + DEFAULT_SUPABASE_URL);
 }
 
 function handleWipeAndResetAllData() {

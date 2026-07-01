@@ -23,9 +23,7 @@
   <header class="fixed top-0 left-0 right-0 z-40 bg-[#fdfbf7]/90 backdrop-blur-md border-b border-[#501537]/10 transition-all duration-300">
     <div class="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
       <a href="#" onclick="navigateTo('home'); return false;" class="flex items-center gap-2.5">
-        <div class="w-10 h-10 bg-[#501537] text-white flex items-center justify-center rounded-xl shadow-md">
-          <i data-lucide="scissors" class="w-5 h-5 text-[#c5a059]"></i>
-        </div>
+        <img src="assets/pics/logo.jpeg" alt="KCTC Logo" class="w-10 h-10 rounded-xl shadow-md object-cover">
         <div>
           <span class="block font-serif font-bold text-lg text-[#501537] tracking-tight leading-none">Komal Creations</span>
           <span class="block text-[9px] font-bold text-[#c5a059] uppercase tracking-widest mt-1">Training Center</span>
@@ -383,7 +381,7 @@
               </div>
               <div>
                 <strong class="block text-[#501537]">KCTC Main Center</strong>
-                <span class="text-xs text-gray-500">Komal Creations, Alohran Khurd, Alohran Road, Nabha, Dist. Patiala, Punjab, 147201</span>
+                <span class="text-xs text-gray-500">Komal Creations Training Center, Bediyan Street, Alohran Gate, Nabha</span>
               </div>
             </div>
 
@@ -494,9 +492,12 @@
     <!-- Admin Sidebar -->
     <aside class="w-64 bg-slate-950 border-r border-slate-800 p-6 flex flex-col justify-between">
       <div class="flex flex-col gap-6">
-        <div>
-          <span class="block text-[10px] font-extrabold text-[#c5a059] uppercase tracking-widest">KCTC BACKEND</span>
-          <h2 class="font-serif font-bold text-lg text-white mt-1">Management Portal</h2>
+        <div class="flex items-center gap-3">
+          <img src="assets/pics/logo.jpeg" alt="KCTC Logo" class="w-9 h-9 rounded-lg object-cover shadow-sm">
+          <div>
+            <span class="block text-[10px] font-extrabold text-[#c5a059] uppercase tracking-widest">KCTC BACKEND</span>
+            <h2 class="font-serif font-bold text-lg text-white mt-1">Management Portal</h2>
+          </div>
         </div>
         
         <nav class="flex flex-col gap-1.5 text-xs font-semibold">
@@ -552,10 +553,16 @@
             <h1 class="text-2xl font-black tracking-tight text-white">System Insights</h1>
             <p class="text-xs text-slate-400">Aggregated vocational course enrollments and stitching operations details.</p>
           </div>
-          <button onclick="triggerDynamicSync()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-bold uppercase tracking-wider rounded-xl transition-all flex items-center gap-2">
-            <i data-lucide="refresh-cw" class="w-4 h-4 text-[#c5a059]"></i>
-            <span>Sync Live DB</span>
-          </button>
+          <div class="flex gap-2">
+            <button onclick="exportAnalyticsCSV()" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-bold uppercase tracking-wider rounded-xl transition-all flex items-center gap-2">
+              <i data-lucide="download" class="w-4 h-4 text-slate-400"></i>
+              <span>Export CSV</span>
+            </button>
+            <button onclick="triggerDynamicSync()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-bold uppercase tracking-wider rounded-xl transition-all flex items-center gap-2">
+              <i data-lucide="refresh-cw" class="w-4 h-4 text-[#c5a059]"></i>
+              <span>Sync Live DB</span>
+            </button>
+          </div>
         </div>
 
         <!-- Metric Grid -->
@@ -628,6 +635,10 @@
           <button onclick="openAddStudentModal()" class="px-4 py-2 bg-[#501537] hover:bg-[#c5a059] text-white text-xs font-bold uppercase tracking-wider rounded-xl transition-all shadow-md flex items-center justify-center gap-2">
             <i data-lucide="user-plus" class="w-4 h-4"></i>
             <span>Add Student</span>
+          </button>
+          <button onclick="exportStudentsCSV()" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-bold uppercase tracking-wider rounded-xl transition-all flex items-center gap-2">
+            <i data-lucide="download" class="w-4 h-4 text-slate-400"></i>
+            <span>CSV</span>
           </button>
         </div>
 
@@ -774,6 +785,10 @@
             <h1 class="text-2xl font-black tracking-tight text-white">Academy Certifications</h1>
             <p class="text-xs text-slate-400">Issue secure vocational designer certificates and manage the public ledger records.</p>
           </div>
+          <button onclick="exportCertificatesCSV()" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-bold uppercase tracking-wider rounded-xl transition-all flex items-center gap-2">
+            <i data-lucide="download" class="w-4 h-4 text-slate-400"></i>
+            <span>Export CSV</span>
+          </button>
         </div>
 
         <div class="grid lg:grid-cols-12 gap-8 items-start">
@@ -867,6 +882,7 @@
         <div class="text-center mb-2">
           <h1 class="text-2xl font-black text-white">Database Credentials</h1>
           <p class="text-xs text-slate-400">Maintain permanent cloud sync via your custom database schema.</p>
+          <span id="db-env-badge" class="inline-block mt-2 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider"></span>
         </div>
 
         <div class="bg-slate-950 p-6 sm:p-8 rounded-2xl border border-slate-800 flex flex-col gap-5">
@@ -913,6 +929,10 @@
               Save &amp; Active
             </button>
           </div>
+
+          <button onclick="resetSupabaseToDefaults()" class="w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 text-[10px] font-bold uppercase tracking-wider rounded-xl transition-all border border-slate-800">
+            Reset to Env Defaults (clears saved override)
+          </button>
 
           <div class="h-px bg-slate-800 my-2"></div>
 
@@ -978,7 +998,7 @@
     </div>
 
     <div class="max-w-7xl mx-auto px-6 border-t border-white/10 mt-10 pt-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 text-xs text-white/50">
-      <span>&copy; 2026 Komal Creations Training Center (KCTC). Alohran Khurd, Alohran Road, Nabha, Dist. Patiala, Punjab, 147201.</span>
+      <span>&copy; 2026 Komal Creations Training Center (KCTC). Bediyan Street, Alohran Gate, Nabha.</span>
       <div class="flex gap-4">
         <span>Verified Registry</span>
         <span>Secure HTTPS Connection</span>
@@ -1105,10 +1125,13 @@
       </button>
 
       <!-- Header with branding -->
-      <div class="bg-[#501537] text-white p-6">
-        <span class="text-[9px] font-extrabold text-[#c5a059] uppercase tracking-widest">KCTC Vocational Student</span>
-        <h2 id="portal-welcome-name" class="font-serif text-2xl font-bold mt-1">Welcome Back, Student!</h2>
-        <p class="text-xs text-white/70 mt-1">Komal Creations, Alohran Khurd, Alohran Road, Nabha, Dist. Patiala, Punjab, 147201</p>
+      <div class="bg-[#501537] text-white p-6 flex items-start gap-4">
+        <img src="assets/pics/logo.jpeg" alt="KCTC Logo" class="w-12 h-12 rounded-xl object-cover border-2 border-[#c5a059]/30 shadow-md shrink-0">
+        <div>
+          <span class="text-[9px] font-extrabold text-[#c5a059] uppercase tracking-widest">KCTC Vocational Student</span>
+          <h2 id="portal-welcome-name" class="font-serif text-2xl font-bold mt-1">Welcome Back, Student!</h2>
+          <p class="text-xs text-white/70 mt-1">Komal Creations Training Center, Bediyan Street, Alohran Gate, Nabha</p>
+        </div>
       </div>
 
       <div class="p-6 grid sm:grid-cols-12 gap-6">
@@ -1315,19 +1338,17 @@
       <div class="p-8 sm:p-12 bg-[#fdfbf7] flex flex-col items-center border-[12px] border-double border-[#501537]/15 relative select-none" id="certificate-print-area">
         
         <!-- Corner decorations -->
-        <div class="absolute top-4 left-4 text-[#501537]/10 text-3xl font-serif">✂️</div>
-        <div class="absolute top-4 right-4 text-[#501537]/10 text-3xl font-serif">✂️</div>
-        <div class="absolute bottom-4 left-4 text-[#501537]/10 text-3xl font-serif">✂️</div>
-        <div class="absolute bottom-4 right-4 text-[#501537]/10 text-3xl font-serif">✂️</div>
+        <img src="assets/pics/sewing machine 2.jpg" alt="" class="absolute top-4 left-4 w-[60px] h-[60px] opacity-20">
+        <img src="assets/pics/sewing machine 2.jpg" alt="" class="absolute top-4 right-4 w-[60px] h-[60px] opacity-20">
+        <img src="assets/pics/sewing machine 2.jpg" alt="" class="absolute bottom-4 left-4 w-[60px] h-[60px] opacity-20">
+        <img src="assets/pics/sewing machine 2.jpg" alt="" class="absolute bottom-4 right-4 w-[60px] h-[60px] opacity-20">
 
         <!-- Academy logo watermark or emblem -->
-        <div class="w-20 h-20 bg-[#501537]/5 text-[#501537] rounded-full flex items-center justify-center border-2 border-dashed border-[#c5a059] mb-4">
-          <i data-lucide="scissors" class="w-10 h-10 text-[#c5a059]/80"></i>
-        </div>
+        <img src="assets/pics/logo.jpeg" alt="KCTC Logo" class="w-20 h-20 rounded-full border-2 border-dashed border-[#c5a059] mb-4 object-cover shadow-sm">
 
         <span class="text-xs font-extrabold text-[#c5a059] uppercase tracking-[0.2em] text-center">KOMAL CREATIONS TRAINING CENTER</span>
         <h1 class="font-serif text-3xl sm:text-4xl font-bold text-[#501537] mt-2 text-center">Certificate of Qualification</h1>
-        <p class="text-xs italic text-[#5a4b53]/80 mt-1">Alohran Khurd, Alohran Road, Nabha, Dist. Patiala, Punjab, 147201</p>
+        <p class="text-xs italic text-[#5a4b53]/80 mt-1">Bediyan Street, Alohran Gate, Nabha</p>
         <p class="text-[9px] font-bold text-[#c5a059] mt-2 tracking-wider">UDYAM Registration No: UDYAM-PB-17-0108616</p>
 
         <div class="w-32 h-px bg-[#c5a059]/30 my-6"></div>
@@ -1391,7 +1412,7 @@
           <i data-lucide="shield-check" class="w-6 h-6 text-[#c5a059]"></i>
         </div>
         <h2 class="font-serif font-bold text-xl text-white">Administrator Portal</h2>
-        <p class="text-xs text-slate-400 mt-1">Komal Creations, Alohran Khurd, Nabha</p>
+        <p class="text-xs text-slate-400 mt-1">Komal Creations Training Center, Bediyan Street, Alohran Gate, Nabha</p>
       </div>
 
       <form onsubmit="handleAdminGatewayLogin(event)" class="flex flex-col gap-4">
@@ -1515,6 +1536,11 @@
           <label for="add-student-paid" class="text-xs text-slate-300 font-bold uppercase cursor-pointer">Mark tailoring tuition fees as PAID</label>
         </div>
 
+        <div>
+          <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Fee Due Date</label>
+          <input type="date" id="add-student-due-date" class="w-full px-4 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-[#c5a059]">
+        </div>
+
         <button type="submit" class="w-full py-3 bg-[#c5a059] hover:bg-[#e5cc96] text-white font-bold text-xs uppercase tracking-wider rounded-xl transition-all shadow-md mt-2">
           Save Enrollment
         </button>
@@ -1619,6 +1645,11 @@
         <div class="flex items-center gap-3 bg-slate-900 p-4 rounded-xl border border-slate-800 mt-2">
           <input type="checkbox" id="edit-student-paid" class="accent-[#c5a059] w-4 h-4 shrink-0">
           <label for="edit-student-paid" class="text-xs text-slate-300 font-bold uppercase cursor-pointer">Tuition Fees are Paid</label>
+        </div>
+
+        <div>
+          <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Fee Due Date</label>
+          <input type="date" id="edit-student-due-date" class="w-full px-4 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-[#c5a059]">
         </div>
 
         <button type="submit" class="w-full py-3 bg-[#c5a059] hover:bg-[#e5cc96] text-white font-bold text-xs uppercase tracking-wider rounded-xl transition-all shadow-md mt-2">
