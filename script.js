@@ -103,52 +103,38 @@ function generateRollNumber() {
 
 // --- CORE SYSTEM INITIALIZER ---
 window.addEventListener('DOMContentLoaded', async () => {
-  // Load cached database files
-  loadStateFromLocalStorage();
+  // 1. Initialize Supabase client and update status indicators
+  initSupabaseClient();
+  updateDatabaseStatusIndicators();
 
-  // Initialize elements
+  // 2. Try to sync live data from Supabase
+  const syncOk = state.supabaseClient ? await syncWithRemoteDatabase() : false;
+
+  // 3. Only if sync failed or returned empty, load from localStorage / defaults
+  if (!syncOk) {
+    loadStateFromLocalStorage();
+  }
+
+  // 4. Initialize all UI components
   renderPortfolioCreations('all');
   renderCoursesList('');
   initializeEstimatorUI();
   updateEstimatorCost();
   setupTestimonialTicker();
-
-  // Initialize custom Supabase if saved
-  initSupabaseClient();
-  updateDatabaseStatusIndicators();
-
-  // Sync background remote tables if active
-  if (state.supabaseClient) {
-    await syncWithRemoteDatabase();
-    // Clean sample data from Supabase if it synced down
-    try {
-      var sampleEmails = ['priya@gmail.com', 'komal@gmail.com'];
-      for (var i = 0; i < sampleEmails.length; i++) {
-        state.supabaseClient.from('admin_students').delete().eq('email', sampleEmails[i]).then(function() {});
-      }
-    } catch(e) {}
-  }
-
-  // Populate course dropdowns in admin forms
   populateCourseDropdowns();
-
-  // Bind Scroll listener for Header active classes
   window.addEventListener('scroll', handleWindowScrollActiveStates);
-
-  // Initialize Lucide Icons
   if (typeof lucide !== 'undefined') {
     lucide.createIcons();
   }
 
-  // Boot-time diagnostics in DevTools console
+  // 5. Console diagnostics (simplified)
   console.log("=== KCTC DIAGNOSTICS ===");
-  console.log("supabase (window):", typeof window.supabase !== 'undefined' ? "LOADED" : "MISSING — check CDN URL in index.html");
-  console.log("state.supabaseClient:", state.supabaseClient ? "ACTIVE" : "NULL");
-  console.log("state.supabaseUrl:", state.supabaseUrl);
-  console.log("Courses in state:", state.courses.length);
-  console.log("Students in state:", state.students.length);
-  console.log("LocalStorage KCTC_STUDENTS:", (JSON.parse(localStorage.getItem('KCTC_STUDENTS') || '[]')).length, "items");
-  console.log("Open Admin Panel → Supabase Config → Test Connection to verify tables exist.");
+  console.log("Environment:", ENV.toUpperCase());
+  console.log("supabaseClient:", state.supabaseClient ? "ACTIVE" : "NULL");
+  console.log("Courses:", state.courses.length);
+  console.log("Students:", state.students.length);
+  console.log("Inquiries:", state.inquiries.length);
+  console.log("Certificates:", state.certificates.length);
   console.log("=========================");
 });
 
@@ -162,8 +148,8 @@ function loadStateFromLocalStorage() {
     state.courses = DEFAULT_COURSES.map(c => ({ ...c, id: generateUUID(), created_at: new Date().toISOString() }));
   }
   state.currentSession = JSON.parse(localStorage.getItem('KCTC_STUDENT_SESSION') || 'null');
-  state.supabaseUrl = localStorage.getItem('KCTC_SUPABASE_URL') || DEFAULT_SUPABASE_URL;
-  state.supabaseKey = localStorage.getItem('KCTC_SUPABASE_KEY') || DEFAULT_SUPABASE_KEY;
+  state.supabaseUrl = DEFAULT_SUPABASE_URL;
+  state.supabaseKey = DEFAULT_SUPABASE_KEY;
 
   // Remove any leftover sample data that may persist from earlier versions
   const sampleEmails = ['priya@gmail.com', 'komal@gmail.com'];
@@ -206,56 +192,37 @@ function updateDatabaseStatusIndicators() {
 
 // --- DUAL DATA SYNCHRONIZATION HYBRID ---
 async function syncWithRemoteDatabase() {
-  if (!state.supabaseClient) return;
+  if (!state.supabaseClient) return false;
 
   try {
-    // 2. Fetch remote records
-    const { data: dbStudents } = await state.supabaseClient.from('admin_students').select('*');
-    const { data: dbInquiries } = await state.supabaseClient.from('inquiries').select('*');
-    const { data: dbCertificates } = await state.supabaseClient.from('certificates').select('*');
-    const { data: dbCourses } = await state.supabaseClient.from('courses').select('*');
+    // Fetch all four tables concurrently
+    const results = await Promise.all([
+      state.supabaseClient.from('admin_students').select('*'),
+      state.supabaseClient.from('inquiries').select('*'),
+      state.supabaseClient.from('certificates').select('*'),
+      state.supabaseClient.from('courses').select('*')
+    ]);
 
-    // 3. Merging lists — always try upsert even if SELECT returns null
-    if (dbStudents) {
-      state.students = mergeLists(state.students, dbStudents);
-    }
-    try {
-      await uploadDiffToSupabase('admin_students', state.students);
-    } catch (e) {
-      console.warn("Students upsert skipped (table may not exist yet):", e);
-    }
+    const [studentsRes, inquiriesRes, certsRes, coursesRes] = results;
 
-    if (dbInquiries) {
-      state.inquiries = mergeLists(state.inquiries, dbInquiries);
+    // Replace local state directly with live data (no merge to prevent stale overrides)
+    if (studentsRes.data) {
+      state.students = studentsRes.data;
     }
-    try {
-      await uploadDiffToSupabase('inquiries', state.inquiries);
-    } catch (e) {
-      console.warn("Inquiries upsert skipped:", e);
+    if (inquiriesRes.data) {
+      state.inquiries = inquiriesRes.data;
     }
-
-    if (dbCertificates) {
-      state.certificates = mergeLists(state.certificates, dbCertificates);
+    if (certsRes.data) {
+      state.certificates = certsRes.data;
     }
-    try {
-      await uploadDiffToSupabase('certificates', state.certificates);
-    } catch (e) {
-      console.warn("Certificates upsert skipped:", e);
-    }
-    // Courses: always attempt upsert regardless of remote state
-    try {
-      const { data: dbCourses } = await state.supabaseClient.from('courses').select('*');
-      if (dbCourses) {
-        state.courses = mergeLists(state.courses, dbCourses);
-      }
-      await uploadDiffToSupabase('courses', state.courses);
-    } catch (e) {
-      console.warn("Courses sync skipped (table may not exist yet):", e);
+    if (coursesRes.data && coursesRes.data.length > 0) {
+      state.courses = coursesRes.data;
     }
 
+    // Cache fetched data to localStorage
     saveStateToLocalStorage();
-    
-    // Reconcile portal active student details
+
+    // Reconcile portal session with live data
     if (state.currentSession) {
       const live = state.students.find(s => s.id === state.currentSession.id || s.email.toLowerCase() === state.currentSession.email.toLowerCase());
       if (live) {
@@ -264,8 +231,11 @@ async function syncWithRemoteDatabase() {
       }
     }
 
+    console.log("Sync complete — students:", state.students.length, "inquiries:", state.inquiries.length, "certificates:", state.certificates.length, "courses:", state.courses.length);
+    return true;
   } catch (error) {
-    console.error("Hybrid database synchronization failed:", error);
+    console.error("Supabase sync failed:", error);
+    return false;
   }
 }
 
