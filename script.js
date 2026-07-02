@@ -12,8 +12,8 @@ const SUPABASE_CONFIG = {
     key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml4bHB3cHRjeXVubnJhZHNkeWZuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI4MDU2OTMsImV4cCI6MjA5ODM4MTY5M30.MebT_StSZb486NlN1HqLPS2y3e7GWC9e_Vx9olvSKZ4'
   },
   production: {
-    url: 'https://gwepnwrdoyfgjvdwuypa.supabase.co',
-    key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3ZXBud3Jkb3lmZ2p2ZHd1eXBhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDc5NjM5MDcsImV4cCI6MjA2MzUzOTkwN30.phqJIn3NwRq_VHp2g47jB6AWH3mRq9Bx4V2r3d6rHC4'
+    url: 'https://anofihrwtqmuikwmfido.supabase.co',
+    key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFub2ZpaHJ3dHFtdWlrd21maWRvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzNDgwMjYsImV4cCI6MjA5NzkyNDAyNn0.ahgj33d_rV1VVbl2hfbLGPvUVJHNSWUb41PYFQNUYPQ'
   }
 };
 
@@ -103,7 +103,9 @@ function generateRollNumber() {
 
 // --- CORE SYSTEM INITIALIZER ---
 window.addEventListener('DOMContentLoaded', async () => {
-  // 1. Initialize Supabase client and update status indicators
+  // 1. Set default credentials and initialize Supabase client
+  state.supabaseUrl = DEFAULT_SUPABASE_URL;
+  state.supabaseKey = DEFAULT_SUPABASE_KEY;
   initSupabaseClient();
   updateDatabaseStatusIndicators();
 
