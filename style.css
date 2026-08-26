@@ -99,6 +99,8 @@ h1, h2, h3, .font-serif {
 
 /* Admin panel Tab styles */
 .admin-tab-btn {
+  position: relative;
+  overflow: hidden;
   width: 100%;
   display: flex;
   align-items: center;
@@ -106,19 +108,278 @@ h1, h2, h3, .font-serif {
   padding: 0.75rem 1rem;
   border-radius: 0.75rem;
   color: #94a3b8;
-  transition: all 0.2s ease;
   cursor: pointer;
   text-align: left;
+  transition: color 0.25s ease,
+              background-color 0.25s ease,
+              transform 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.25s ease;
+}
+
+/* Sliding gold indicator bar on the left edge */
+.admin-tab-btn::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: linear-gradient(180deg, #c5a059, #e5cc96);
+  transform: translateY(-50%);
+  transition: height 0.28s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .admin-tab-btn:hover {
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: rgba(197, 160, 89, 0.08);
   color: #ffffff;
+  transform: translateX(3px);
+}
+
+.admin-tab-btn:hover::before { height: 45%; }
+
+.admin-tab-btn:hover svg {
+  transform: scale(1.15) rotate(-6deg);
+  color: #c5a059;
+}
+
+.admin-tab-btn svg {
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), color 0.25s ease;
 }
 
 .admin-tab-btn.active {
-  background-color: #501537;
+  background: linear-gradient(100deg, #501537 0%, #7c2658 55%, #501537 100%);
   color: #ffffff;
+  box-shadow: 0 8px 20px -10px rgba(197, 160, 89, 0.55),
+              inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.admin-tab-btn.active::before { height: 70%; }
+
+.admin-tab-btn.active svg { color: #c5a059; }
+
+/* Sheen sweep when a tab becomes active */
+.admin-tab-btn.active::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(197, 160, 89, 0.28), transparent);
+  transform: translateX(-120%);
+  animation: tabSheen 0.75s cubic-bezier(0.16, 1, 0.3, 1);
+  pointer-events: none;
+}
+
+@keyframes tabSheen {
+  to { transform: translateX(120%); }
+}
+
+/* ==========================================================================
+   ADMIN — PANEL SECTION TRANSITIONS
+   ========================================================================== */
+@keyframes adminSecIn {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.admin-sec:not(.hidden) {
+  animation: adminSecIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Stagger children of a freshly shown section */
+.admin-sec:not(.hidden) > * {
+  animation: adminSecIn 0.45s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+.admin-sec:not(.hidden) > *:nth-child(1) { animation-delay: 0.02s; }
+.admin-sec:not(.hidden) > *:nth-child(2) { animation-delay: 0.08s; }
+.admin-sec:not(.hidden) > *:nth-child(3) { animation-delay: 0.14s; }
+.admin-sec:not(.hidden) > *:nth-child(4) { animation-delay: 0.20s; }
+
+/* ==========================================================================
+   ADMIN — METRIC / STAT CARDS
+   ========================================================================== */
+.admin-stat-card {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(145deg, #020617 0%, #0f172a 100%);
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              border-color 0.3s ease,
+              box-shadow 0.3s ease;
+}
+
+/* Gold top accent line that widens on hover */
+.admin-stat-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 2px;
+  width: 0;
+  background: linear-gradient(90deg, #c5a059, #e5cc96, transparent);
+  transition: width 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.admin-stat-card:hover {
+  transform: translateY(-5px);
+  border-color: rgba(197, 160, 89, 0.45);
+  box-shadow: 0 18px 32px -18px rgba(197, 160, 89, 0.5);
+}
+
+.admin-stat-card:hover::before { width: 100%; }
+
+.admin-stat-card:hover .admin-stat-icon {
+  transform: scale(1.12) rotate(-8deg);
+  background-color: rgba(197, 160, 89, 0.18);
+}
+
+.admin-stat-icon {
+  transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.3s ease;
+}
+
+/* Count-up shimmer on the number itself */
+@keyframes statCount {
+  from { opacity: 0; transform: translateY(8px) scale(0.94); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.admin-stat-value {
+  display: inline-block;
+  animation: statCount 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ==========================================================================
+   ADMIN — PANELS, TABLES, BUTTONS
+   ========================================================================== */
+.admin-panel-card {
+  background: linear-gradient(160deg, #020617 0%, #0b1220 100%);
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.admin-panel-card:hover {
+  border-color: rgba(197, 160, 89, 0.25);
+  box-shadow: 0 16px 40px -24px rgba(197, 160, 89, 0.4);
+}
+
+/* Table rows: gold left reveal + lift */
+#admin-students-tbody tr,
+#admin-inquiries-tbody tr,
+#admin-courses-tbody tr {
+  position: relative;
+  transition: background-color 0.22s ease, transform 0.22s ease, box-shadow 0.22s ease;
+}
+
+#admin-students-tbody tr:hover,
+#admin-inquiries-tbody tr:hover,
+#admin-courses-tbody tr:hover {
+  background-color: rgba(197, 160, 89, 0.06);
+  transform: translateX(3px);
+  box-shadow: inset 3px 0 0 0 #c5a059;
+}
+
+/* Rows animate in as the table renders */
+@keyframes rowIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+#admin-students-tbody tr,
+#admin-inquiries-tbody tr,
+#admin-courses-tbody tr,
+#issued-certificates-container > div {
+  animation: rowIn 0.32s ease backwards;
+}
+
+/* Generic press feedback for admin buttons */
+#admin-panel button:active { transform: scale(0.96); }
+
+#admin-panel button {
+  transition: transform 0.16s cubic-bezier(0.16, 1, 0.3, 1),
+              background-color 0.22s ease,
+              border-color 0.22s ease,
+              color 0.22s ease,
+              box-shadow 0.22s ease;
+}
+
+/* Gradient primary action buttons */
+.admin-btn-primary {
+  background: linear-gradient(100deg, #501537, #7c2658) !important;
+  position: relative;
+  overflow: hidden;
+}
+
+.admin-btn-primary:hover {
+  background: linear-gradient(100deg, #c5a059, #e5cc96) !important;
+  box-shadow: 0 10px 24px -12px rgba(197, 160, 89, 0.75);
+  transform: translateY(-2px);
+}
+
+/* Admin header gradient underline */
+#admin-header {
+  background-image: linear-gradient(180deg, rgba(80, 21, 55, 0.35), transparent);
+  border-bottom: 1px solid rgba(197, 160, 89, 0.18);
+}
+
+/* Sidebar subtle gradient */
+#admin-panel aside {
+  background-image: linear-gradient(180deg, #020617 0%, #0b1220 60%, #020617 100%);
+}
+
+/* Live DB status dot ping */
+@keyframes dbPing {
+  0%   { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55); }
+  70%  { box-shadow: 0 0 0 7px rgba(16, 185, 129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+#db-status-dot { animation: dbPing 2s ease-out infinite; }
+
+/* Modal overlays pop in */
+#admin-payment-overlay > div,
+#admin-docs-overlay > div {
+  animation: fadeIn 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .admin-tab-btn,
+  .admin-tab-btn::before,
+  .admin-tab-btn::after,
+  .admin-sec:not(.hidden),
+  .admin-sec:not(.hidden) > *,
+  .admin-stat-card,
+  .admin-stat-value,
+  #admin-students-tbody tr,
+  #admin-inquiries-tbody tr,
+  #admin-courses-tbody tr,
+  #issued-certificates-container > div,
+  #db-status-dot,
+  #admin-panel button {
+    animation: none !important;
+    transition: none !important;
+    transform: none !important;
+  }
+}
+
+/* Admin sidebar compact mode */
+#admin-sidebar.sidebar-compact {
+  width: 68px !important;
+  min-width: 68px !important;
+}
+
+#admin-sidebar.sidebar-compact .sidebar-label {
+  display: none !important;
+}
+
+#admin-sidebar.sidebar-compact .admin-tab-btn {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+#admin-sidebar.sidebar-compact .admin-tab-btn::before {
+  height: 0 !important;
+}
+
+#admin-sidebar.sidebar-compact .admin-tab-btn.active::before {
+  height: 70% !important;
 }
 
 /* Animations */
@@ -129,6 +390,196 @@ h1, h2, h3, .font-serif {
 
 .animate-fade-in {
   animation: fadeIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ==========================================================================
+   STUDENT PORTAL — COMING SOON CARDS
+   ========================================================================== */
+@keyframes soonRise {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes soonShimmer {
+  0%   { transform: translateX(-120%); }
+  100% { transform: translateX(220%); }
+}
+
+@keyframes soonPulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+.soon-card {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 0.85rem 0.9rem;
+  border-radius: 1rem;
+  border: 1px dashed rgba(80, 21, 55, 0.22);
+  background-color: #ffffff;
+  cursor: pointer;
+  text-align: left;
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.25s ease,
+              border-color 0.25s ease,
+              background-color 0.25s ease;
+  /* Staggered entrance driven by the inline --soon-delay variable */
+  opacity: 0;
+  animation: soonRise 0.45s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation-delay: var(--soon-delay, 0ms);
+}
+
+.soon-card:hover {
+  transform: translateY(-4px);
+  border-color: #c5a059;
+  border-style: solid;
+  background-color: #fffdf8;
+  box-shadow: 0 12px 24px -10px rgba(80, 21, 55, 0.28);
+}
+
+.soon-card:active {
+  transform: translateY(-1px) scale(0.985);
+}
+
+/* Light sweep across the card on hover */
+.soon-card::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 45%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(197, 160, 89, 0.22),
+    transparent
+  );
+  transform: translateX(-120%);
+  pointer-events: none;
+}
+
+.soon-card:hover::after {
+  animation: soonShimmer 0.9s ease forwards;
+}
+
+.soon-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.65rem;
+  background-color: rgba(197, 160, 89, 0.12);
+  color: #c5a059;
+  margin-bottom: 0.35rem;
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.25s ease;
+}
+
+.soon-card:hover .soon-icon {
+  transform: scale(1.12) rotate(-6deg);
+  background-color: rgba(197, 160, 89, 0.22);
+}
+
+.soon-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #501537;
+  line-height: 1.2;
+}
+
+.soon-sub {
+  font-size: 0.6rem;
+  color: #9ca3af;
+  font-weight: 600;
+}
+
+.soon-badge {
+  position: absolute;
+  top: 0.6rem;
+  right: 0.6rem;
+  font-size: 0.5rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #c5a059;
+  background-color: rgba(197, 160, 89, 0.12);
+  border: 1px solid rgba(197, 160, 89, 0.28);
+  padding: 0.12rem 0.4rem;
+  border-radius: 9999px;
+  animation: soonPulse 2.4s ease-in-out infinite;
+}
+
+/* ==========================================================================
+   STUDENT PORTAL — GENERAL MOTION
+   ========================================================================== */
+@keyframes portalPop {
+  from { opacity: 0; transform: translateY(18px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.animate-portal-pop {
+  animation: portalPop 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.animate-toast-in {
+  animation: toastIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Status dot gently pulses so live state feels alive */
+@keyframes statusPing {
+  0%   { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+  70%  { box-shadow: 0 0 0 6px transparent; opacity: 0.85; }
+  100% { box-shadow: 0 0 0 0 transparent; opacity: 1; }
+}
+
+#portal-status-dot {
+  animation: statusPing 2s ease-out infinite;
+}
+
+/* Document rows fade in as they are rendered */
+.doc-field {
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.doc-field:hover {
+  transform: translateY(-2px);
+  border-color: rgba(197, 160, 89, 0.6);
+  box-shadow: 0 8px 18px -12px rgba(80, 21, 55, 0.35);
+}
+
+/* Payment receipt rows slide in */
+@keyframes receiptIn {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+#portal-payments-list > div {
+  animation: receiptIn 0.3s ease forwards;
+}
+
+/* Respect users who prefer reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .soon-card,
+  .soon-badge,
+  .animate-portal-pop,
+  .animate-toast-in,
+  #portal-status-dot,
+  #portal-payments-list > div {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+  .soon-card:hover::after { animation: none !important; }
 }
 
 /* Scrollbar customizations */

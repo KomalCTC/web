@@ -92,24 +92,336 @@ function generateUUID() {
   });
 }
 
+function parseRollKey(roll) {
+  const match = /^KCTC-(\d{4})-(\d+)$/.exec(String(roll || '').trim().toUpperCase());
+  if (!match) return null;
+  return { year: parseInt(match[1], 10), seq: parseInt(match[2], 10) };
+}
+
+function rollSortKey(roll) {
+  const parsed = parseRollKey(roll);
+  if (!parsed) return Number.MAX_SAFE_INTEGER;
+  return parsed.year * 100000 + parsed.seq;
+}
+
 function generateRollNumber() {
   const year = new Date().getFullYear();
-  const key = 'KCTC_ROLL_COUNTER_' + year;
-  let counter = parseInt(localStorage.getItem(key) || '0');
-  counter++;
-  localStorage.setItem(key, String(counter));
-  return 'KCTC-' + year + '-' + String(counter).padStart(3, '0');
+  const prefix = 'KCTC-' + year + '-';
+
+  // Derive the next number from the actual student registry (synced from
+  // Supabase) so the series stays continuous across browsers and devices.
+  let maxSeq = 0;
+  state.students.forEach(s => {
+    const parsed = parseRollKey(s.roll_number);
+    if (parsed && parsed.year === year && parsed.seq > maxSeq) {
+      maxSeq = parsed.seq;
+    }
+  });
+
+  // Guard against collisions with any non-standard roll numbers already used.
+  const taken = new Set(state.students.map(s => String(s.roll_number || '').trim().toUpperCase()));
+  let next = maxSeq + 1;
+  let candidate = prefix + String(next).padStart(3, '0');
+  while (taken.has(candidate)) {
+    next++;
+    candidate = prefix + String(next).padStart(3, '0');
+  }
+  return candidate;
+}
+
+// Allocates the next roll number, checking the live database first so
+// concurrent registrations from different devices don't reuse the same number.
+async function reserveRollNumber() {
+  if (state.supabaseClient) {
+    try {
+      const { data, error: rollErr } = await state.supabaseClient
+        .from('admin_students')
+        .select('roll_number');
+      if (!rollErr && data) {
+        const known = new Set(state.students.map(s => String(s.roll_number || '').trim().toUpperCase()));
+        data.forEach(row => {
+          const roll = String(row.roll_number || '').trim().toUpperCase();
+          if (roll && !known.has(roll)) {
+            // Track remote-only rolls so the generator skips them.
+            state.students.push({ roll_number: roll, __rollPlaceholder: true });
+          }
+        });
+      }
+    } catch (err) {
+      console.error('Could not read live roll numbers, falling back to local:', err);
+    }
+  }
+
+  const roll = generateRollNumber();
+  // Drop the temporary placeholders used only for collision checking.
+  state.students = state.students.filter(s => !s.__rollPlaceholder);
+  return roll;
+}
+
+function sortStudentsByRoll() {
+  state.students.sort((a, b) => {
+    const diff = rollSortKey(a.roll_number) - rollSortKey(b.roll_number);
+    if (diff !== 0) return diff;
+    return new Date(a.created_at || 0) - new Date(b.created_at || 0);
+  });
+}
+
+// Assign roll numbers to legacy records saved before the series existed.
+//
+// SAFETY: this MUST NOT run automatically. It writes to the live database, and
+// on production that would silently rewrite real student records the first time
+// any visitor opened the site. It is now an explicit admin action only, guarded
+// by a confirmation, and it always takes a backup snapshot first.
+async function backfillMissingRollNumbers(options) {
+  const opts = options || {};
+  if (!opts.confirmedByAdmin) {
+    console.warn('backfillMissingRollNumbers() skipped: requires an explicit admin action.');
+    return { skipped: true };
+  }
+
+  const missing = state.students.filter(s => !parseRollKey(s.roll_number));
+  if (missing.length === 0) return { updated: 0 };
+
+  missing
+    .sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0))
+    .forEach(s => { s.roll_number = generateRollNumber(); });
+
+  sortStudentsByRoll();
+  saveStateToLocalStorage();
+
+  if (state.supabaseClient) {
+    const { error: backfillErr } = await state.supabaseClient.from('admin_students').upsert(missing);
+    if (backfillErr) {
+      console.error('Roll number backfill failed to sync:', backfillErr);
+      return { updated: missing.length, error: backfillErr };
+    }
+  }
+  console.log('Backfilled roll numbers for ' + missing.length + ' student(s).');
+  return { updated: missing.length };
+}
+
+// Admin-triggered wrapper: warns, forces a backup, then backfills.
+async function adminRunRollNumberBackfill() {
+  const missing = state.students.filter(s => !parseRollKey(s.roll_number));
+  if (missing.length === 0) {
+    alert('All students already have a valid roll number. Nothing to do.');
+    return;
+  }
+  const msg = 'This will assign NEW roll numbers to ' + missing.length + ' student(s) that currently have none, and write the change to the live database.\n\n' +
+              'A backup file will be downloaded first.\n\nContinue?';
+  if (!confirm(msg)) return;
+
+  downloadFullBackup('before-rollnumber-backfill');
+
+  const res = await backfillMissingRollNumbers({ confirmedByAdmin: true });
+  renderStudentsTable();
+  updateAnalyticsDashboard();
+  alert(res && res.error
+    ? 'Assigned locally but cloud sync failed: ' + (res.error.message || res.error)
+    : 'Assigned roll numbers to ' + (res ? res.updated : 0) + ' student(s).');
+}
+
+async function batchLinkUnlinkedStudents() {
+  const unlinked = state.students.filter(s => !s.auth_id);
+  if (unlinked.length === 0) {
+    alert('All students are already linked to Supabase Auth. Nothing to do.');
+    return;
+  }
+
+  const msg = 'This will create Supabase Auth accounts for ' + unlinked.length + ' student(s) so they can login to the student portal.\n\n' +
+              'Default password for all: TempPass123!\n\n' +
+              'Students should change their password after first login.\n\nContinue?';
+  if (!confirm(msg)) return;
+
+  if (!state.supabaseClient) {
+    alert('Supabase not configured.');
+    return;
+  }
+
+  try {
+    const { data, error } = await state.supabaseClient.rpc('batch_link_unlinked_students');
+    if (error) {
+      alert('Failed: ' + error.message);
+      return;
+    }
+    await syncWithRemoteDatabase();
+    renderStudentsTable();
+    updateAnalyticsDashboard();
+    alert('Successfully linked ' + (data || 0) + ' student(s) to Supabase Auth.\n\nDefault password: TempPass123!');
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+}
+
+function toggleSelectAllStudents(masterCheckbox) {
+  const checkboxes = document.querySelectorAll('.student-checkbox');
+  checkboxes.forEach(cb => {
+    const row = cb.closest('tr');
+    // Only toggle visible (non-filtered-out) checkboxes
+    if (row && row.offsetParent !== null) {
+      cb.checked = masterCheckbox.checked;
+    }
+  });
+}
+
+function getSelectedStudentIds() {
+  const checked = document.querySelectorAll('.student-checkbox:checked');
+  return Array.from(checked).map(cb => cb.getAttribute('data-student-id'));
+}
+
+async function linkSelectedStudents() {
+  const ids = getSelectedStudentIds();
+  if (ids.length === 0) {
+    alert('No students selected. Use the checkboxes on the left to select students.');
+    return;
+  }
+
+  const selected = state.students.filter(s => ids.includes(s.id));
+  const unlinked = selected.filter(s => !s.auth_id);
+
+  if (unlinked.length === 0) {
+    alert('All selected students are already linked to Supabase Auth.');
+    return;
+  }
+
+  const linked = selected.filter(s => s.auth_id);
+  let msg = unlinked.length + ' student(s) will be linked to Supabase Auth.\n';
+  if (linked.length > 0) {
+    msg += '\n' + linked.length + ' already linked (will be skipped).\n';
+  }
+  msg += '\nDefault password: TempPass123!\n\nContinue?';
+  if (!confirm(msg)) return;
+
+  if (!state.supabaseClient) {
+    alert('Supabase not configured.');
+    return;
+  }
+
+  try {
+    const { data, error } = await state.supabaseClient.rpc('batch_link_students_by_ids', {
+      p_student_ids: unlinked.map(s => s.id)
+    });
+    if (error) {
+      alert('Failed: ' + error.message);
+      return;
+    }
+    await syncWithRemoteDatabase();
+    renderStudentsTable();
+    updateAnalyticsDashboard();
+    alert('Successfully linked ' + (data || 0) + ' student(s) to Supabase Auth.\n\nDefault password: TempPass123!');
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
 }
 
 // --- CORE SYSTEM INITIALIZER ---
 window.addEventListener('DOMContentLoaded', async () => {
   // 1. Set default credentials and initialize Supabase client
-  state.supabaseUrl = DEFAULT_SUPABASE_URL;
-  state.supabaseKey = DEFAULT_SUPABASE_KEY;
-  initSupabaseClient();
+  state.supabaseUrl = localStorage.getItem('KCTC_SUPABASE_URL') || DEFAULT_SUPABASE_URL;
+  state.supabaseKey = localStorage.getItem('KCTC_SUPABASE_KEY') || DEFAULT_SUPABASE_KEY;
+  const supabaseActive = localStorage.getItem('KCTC_SUPABASE_ACTIVE');
+  if (supabaseActive === '0') {
+    state.supabaseClient = null;
+  } else {
+    if (!supabaseActive) localStorage.setItem('KCTC_SUPABASE_ACTIVE', '1');
+    initSupabaseClient();
+  }
   updateDatabaseStatusIndicators();
 
-  // 2. Try to sync live data from Supabase
+  // 1a. Restore sidebar compact/full state from localStorage
+  restoreSidebarState();
+
+  // 1b. Restore Supabase Auth session
+  if (state.supabaseClient) {
+    const { data: { session } } = await state.supabaseClient.auth.getSession();
+    if (session) {
+      state.supabaseClient.auth.setSession(session);
+
+      // Check if this user is an admin — if so, skip student portal session restore
+      const { data: adminCheck } = await state.supabaseClient
+        .from('admin_users')
+        .select('email')
+        .eq('email', session.user.email)
+        .maybeSingle();
+
+      if (!adminCheck) {
+        // Not an admin — fetch student profile
+        const { data: student } = await state.supabaseClient
+          .from('admin_students')
+          .select('*')
+          .eq('auth_id', session.user.id)
+          .single();
+        if (student) {
+          state.currentSession = {
+            id: student.id,
+            auth_id: session.user.id,
+            email: student.email,
+            full_name: student.full_name,
+            father_name: student.father_name,
+            dob: student.dob,
+            phone: student.phone,
+            enrolled_course: student.enrolled_course
+          };
+          saveStateToLocalStorage();
+        }
+      } else {
+        // Admin user on admin page — restore admin session so sync has auth
+        if (isAdminPage()) {
+          sessionStorage.setItem('KCTC_ADMIN_SESSION', '1');
+        } else {
+          // Admin on public page — clear student/admin session but keep Supabase Auth alive
+          // so admin can navigate back to admin.html without re-login
+          sessionStorage.removeItem('KCTC_ADMIN_SESSION');
+          localStorage.removeItem('KCTC_STUDENT_SESSION');
+          state.currentSession = null;
+        }
+      }
+    }
+  }
+
+  // 1c. Restore the portal session BEFORE syncing (fallback for localStorage)
+  if (!state.currentSession) {
+    state.currentSession = JSON.parse(localStorage.getItem('KCTC_STUDENT_SESSION') || 'null');
+  }
+
+  // For admin page: restore admin session FIRST so sync runs with admin auth
+  let isAdminLoggedIn = false;
+  if (isAdminPage()) {
+    isAdminLoggedIn = sessionStorage.getItem('KCTC_ADMIN_SESSION') === '1';
+    if (state.supabaseClient && isAdminLoggedIn) {
+      const { data: { session } } = await state.supabaseClient.auth.getSession();
+      if (session) {
+        state.supabaseClient.auth.setSession(session);
+
+        // Auto-create admin_users record if missing (prevents is_admin() RLS failure)
+        const { data: adminCheck } = await state.supabaseClient
+          .from('admin_users')
+          .select('email')
+          .eq('email', session.user.email)
+          .maybeSingle();
+        if (!adminCheck) {
+          await state.supabaseClient
+            .from('admin_users')
+            .insert({ email: session.user.email, auth_id: session.user.id });
+        } else if (!adminCheck.auth_id) {
+          await state.supabaseClient
+            .from('admin_users')
+            .update({ auth_id: session.user.id })
+            .eq('email', session.user.email);
+        }
+
+        state.currentSession = {
+          auth_id: session.user.id,
+          email: session.user.email,
+          full_name: session.user.user_metadata?.full_name || 'Admin User',
+          isAdmin: true
+        };
+        saveStateToLocalStorage();
+      }
+    }
+  }
+
+  // 2. Try to sync live data from Supabase (now runs with proper auth)
   const syncOk = state.supabaseClient ? await syncWithRemoteDatabase() : false;
 
   // 3. Only if sync failed or returned empty, load from localStorage / defaults
@@ -117,14 +429,43 @@ window.addEventListener('DOMContentLoaded', async () => {
     loadStateFromLocalStorage();
   }
 
-  // 4. Initialize all UI components
-  renderPortfolioCreations('all');
-  renderCoursesList('');
-  initializeEstimatorUI();
-  updateEstimatorCost();
-  setupTestimonialTicker();
+  // 3b. Keep the registry in roll-number order. Backfilling missing roll
+  //     numbers is deliberately NOT automatic — it writes to the live database
+  //     and must be triggered by an admin (Student Registry → Fix Roll Numbers).
+  sortStudentsByRoll();
+
+  // 4. Initialize only the UI that exists on this page
   populateCourseDropdowns();
-  window.addEventListener('scroll', handleWindowScrollActiveStates);
+
+  if (isAdminPage()) {
+    // admin.html - restore gate state, then show the panel or the login gate.
+    state.isAdminLoggedIn = isAdminLoggedIn;
+    toggleAdminPanel(true);
+    syncAdminSidebarToViewport();
+    window.addEventListener('resize', syncAdminSidebarToViewport);
+    renderDbToggle();
+  } else {
+    // index.html — public site widgets.
+    renderPortfolioCreations('all');
+    renderCoursesList('');
+    initializeEstimatorUI();
+    updateEstimatorCost();
+    setupTestimonialTicker();
+    window.addEventListener('scroll', handleWindowScrollActiveStates);
+
+    // Honour deep links like index.html#courses coming from the admin page.
+    if (window.location.hash) {
+      const target = window.location.hash.slice(1);
+      if (target === 'open-student-portal') {
+        // Arrived from the admin header's Student Portal button.
+        history.replaceState(null, '', window.location.pathname);
+        setTimeout(() => openStudentPortal(), 60);
+      } else if (document.getElementById(target)) {
+        setTimeout(() => scrollToSection(target), 50);
+      }
+    }
+  }
+
   if (typeof lucide !== 'undefined') {
     lucide.createIcons();
   }
@@ -150,12 +491,13 @@ function loadStateFromLocalStorage() {
     state.courses = DEFAULT_COURSES.map(c => ({ ...c, id: generateUUID(), created_at: new Date().toISOString() }));
   }
   state.currentSession = JSON.parse(localStorage.getItem('KCTC_STUDENT_SESSION') || 'null');
-  state.supabaseUrl = DEFAULT_SUPABASE_URL;
-  state.supabaseKey = DEFAULT_SUPABASE_KEY;
+  state.supabaseUrl = localStorage.getItem('KCTC_SUPABASE_URL') || DEFAULT_SUPABASE_URL;
+  state.supabaseKey = localStorage.getItem('KCTC_SUPABASE_KEY') || DEFAULT_SUPABASE_KEY;
 
-  // Remove any leftover sample data that may persist from earlier versions
-  const sampleEmails = ['priya@gmail.com', 'komal@gmail.com'];
-  state.students = state.students.filter(s => !sampleEmails.includes(s.email.toLowerCase()));
+  // NOTE: an earlier version silently dropped students whose email matched a
+  // hardcoded sample list. That was removed — on production those could be real
+  // people, and hiding them from the registry is worse than showing demo rows.
+  sortStudentsByRoll();
   saveStateToLocalStorage();
 }
 
@@ -210,6 +552,7 @@ async function syncWithRemoteDatabase() {
     // Replace local state directly with live data (no merge to prevent stale overrides)
     if (studentsRes.data) {
       state.students = studentsRes.data;
+      sortStudentsByRoll();
     }
     if (inquiriesRes.data) {
       state.inquiries = inquiriesRes.data;
@@ -284,15 +627,28 @@ async function triggerDynamicSync() {
   alert("Live cloud tables synchronized successfully!");
 }
 
+// --- PAGE DETECTION ---
+// The site is split into two pages that share this script:
+//   index.html -> public site      (#public-site present)
+//   admin.html -> admin dashboard  (#admin-panel present)
+function isAdminPage() {
+  return !!document.getElementById('admin-panel');
+}
+
 // --- NAVIGATION & DOM VIEW TOGGLERS ---
+function navigateTo(section) {
+  if (isAdminPage()) {
+    window.location.href = 'index.html' + (section && section !== 'home' ? '#' + section : '');
+    return;
+  }
+  scrollToSection(section || 'home');
+}
+
 function scrollToSection(id) {
-  const publicView = document.getElementById('public-site');
-  const adminView = document.getElementById('admin-panel');
-  if (publicView && adminView) {
-    publicView.classList.remove('hidden');
-    adminView.classList.add('hidden');
-    const footerSite = document.getElementById('footer-site');
-    if (footerSite) footerSite.classList.remove('hidden');
+  // On the admin page there are no public sections — jump to the public page.
+  if (isAdminPage()) {
+    window.location.href = 'index.html#' + id;
+    return;
   }
   const el = document.getElementById(id);
   if (el) {
@@ -682,6 +1038,45 @@ Please verify scheduling measurements and delivery timelines.`;
   scrollToSection('contact');
 }
 
+// --- CERTIFICATE DATE HELPERS ---
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// Converts a "YYYY-MM" value from <input type="month"> into "Mon YYYY".
+function formatMonthYear(value) {
+  if (!value) return '';
+  const parts = String(value).split('-');
+  if (parts.length < 2) return String(value);
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10);
+  if (isNaN(year) || isNaN(month) || month < 1 || month > 12) return String(value);
+  return MONTH_NAMES[month - 1] + ' ' + year;
+}
+
+// Fills the shared certificate viewer modal from a certificate record.
+function populateCertificateViewer(cert) {
+  document.getElementById('cert-view-name').innerText = cert.student_name;
+  document.getElementById('cert-view-father').innerText = cert.father_name;
+  document.getElementById('cert-view-course').innerText = cert.course_name;
+  document.getElementById('cert-view-roll').innerText = cert.roll_number;
+  document.getElementById('cert-view-grade').innerText = cert.grade;
+  document.getElementById('cert-view-year').innerText = cert.passing_year;
+  document.getElementById('cert-view-code').innerText = cert.verification_code;
+
+  // Month range is optional — older certificates only have a passing year.
+  const wrap = document.getElementById('cert-view-duration-wrap');
+  const fromEl = document.getElementById('cert-view-from');
+  const toEl = document.getElementById('cert-view-to');
+  if (wrap && fromEl && toEl) {
+    if (cert.from_month && cert.to_month) {
+      fromEl.innerText = formatMonthYear(cert.from_month);
+      toEl.innerText = formatMonthYear(cert.to_month);
+      wrap.classList.remove('hidden');
+    } else {
+      wrap.classList.add('hidden');
+    }
+  }
+}
+
 // --- SECURE CERTIFICATE VERIFICATION ---
 function handleCertificateVerification(e) {
   e.preventDefault();
@@ -696,13 +1091,7 @@ function handleCertificateVerification(e) {
 
   if (cert) {
     // Populate and trigger display modal
-    document.getElementById('cert-view-name').innerText = cert.student_name;
-    document.getElementById('cert-view-father').innerText = cert.father_name;
-    document.getElementById('cert-view-course').innerText = cert.course_name;
-    document.getElementById('cert-view-roll').innerText = cert.roll_number;
-    document.getElementById('cert-view-grade').innerText = cert.grade;
-    document.getElementById('cert-view-year').innerText = cert.passing_year;
-    document.getElementById('cert-view-code').innerText = cert.verification_code;
+    populateCertificateViewer(cert);
 
     const modal = document.getElementById('certificate-viewer-modal');
     if (modal) modal.classList.remove('hidden');
@@ -798,7 +1187,59 @@ function openStudentPortal() {
     const feesAmount = student ? student.fees_amount : 4500;
     const status = student ? student.enrollment_status : 'pending';
 
+    // Fee breakdown: total, paid so far, and what is still outstanding.
+    const paymentList = (student && student.payments) ? student.payments : [];
+    const totalPaid = paymentList.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const pending = Math.max(0, feesAmount - totalPaid);
+
     document.getElementById('portal-fees-amount').innerText = `₹${feesAmount}`;
+    document.getElementById('portal-fees-paid').innerText = `₹${totalPaid}`;
+
+    const pendingEl = document.getElementById('portal-fees-pending');
+    pendingEl.innerText = `₹${pending}`;
+    pendingEl.className = pending > 0
+      ? 'text-sm font-extrabold text-red-600'
+      : 'text-sm font-extrabold text-emerald-600';
+
+    // Due date, highlighted red when overdue and money is still owed.
+    const dueEl = document.getElementById('portal-fees-due-date');
+    const dueRaw = student ? student.due_date : null;
+    if (dueRaw) {
+      const dueDate = new Date(dueRaw);
+      const overdue = pending > 0 && dueDate < new Date();
+      dueEl.innerText = dueDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) + (overdue ? ' (OVERDUE)' : '');
+      dueEl.className = overdue ? 'text-xs font-bold text-red-600' : 'text-xs font-bold text-[#501537]';
+    } else {
+      dueEl.innerText = 'Not set';
+      dueEl.className = 'text-xs font-bold text-gray-400';
+    }
+
+    // Individual payment receipts, newest first.
+    const payBox = document.getElementById('portal-payments-box');
+    const payList = document.getElementById('portal-payments-list');
+    if (paymentList.length > 0) {
+      payList.innerHTML = '';
+      paymentList
+        .slice()
+        .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
+        .forEach(p => {
+          const when = p.date
+            ? new Date(p.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+            : '—';
+          const row = document.createElement('div');
+          row.className = 'flex justify-between items-center bg-white border border-gray-200 rounded-lg px-2.5 py-1.5';
+          row.innerHTML =
+            '<div class="flex flex-col"><span class="text-[11px] font-bold text-emerald-700">₹' + (p.amount || 0) + '</span>' +
+            (p.note ? '<span class="text-[9px] text-gray-400">' + p.note + '</span>' : '') +
+            '</div><div class="text-right"><span class="text-[10px] text-gray-500 block">' + when + '</span>' +
+            '<span class="text-[9px] font-bold text-gray-400 uppercase">' + (p.method || 'Cash') + '</span></div>';
+          payList.appendChild(row);
+        });
+      payBox.classList.remove('hidden');
+    } else {
+      payList.innerHTML = '';
+      payBox.classList.add('hidden');
+    }
     
     const statusDot = document.getElementById('portal-status-dot');
     const statusTxt = document.getElementById('portal-status-text');
@@ -840,7 +1281,23 @@ function openStudentPortal() {
     // Render uploaded documents
     renderTypedDocs(student);
 
-    document.getElementById('student-portal-modal').classList.remove('hidden');
+    const portalModal = document.getElementById('student-portal-modal');
+    portalModal.classList.remove('hidden');
+
+    // Animate the dialog in and replay the coming-soon card stagger.
+    const portalCard = portalModal.querySelector('.bg-white');
+    if (portalCard) {
+      portalCard.classList.remove('animate-portal-pop');
+      void portalCard.offsetWidth;
+      portalCard.classList.add('animate-portal-pop');
+    }
+    replayComingSoonAnimation();
+
+    // Hide any leftover toast from a previous session.
+    const soonToast = document.getElementById('portal-soon-toast');
+    if (soonToast) soonToast.classList.add('hidden');
+
+    if (typeof lucide !== 'undefined') { lucide.createIcons(); }
   } else {
     // Open auth login modal
     document.getElementById('student-auth-modal').classList.remove('hidden');
@@ -850,6 +1307,49 @@ function openStudentPortal() {
 
 function closeStudentPortal() {
   document.getElementById('student-portal-modal').classList.add('hidden');
+}
+
+// The portal markup only exists on index.html. From the admin page we navigate
+// across and ask the public page to open the portal on arrival.
+function goToStudentPortal() {
+  if (isAdminPage()) {
+    window.location.href = 'index.html#open-student-portal';
+    return;
+  }
+  openStudentPortal();
+}
+
+// --- COMING SOON FEATURE PLACEHOLDERS ---
+let soonToastTimer = null;
+
+function showComingSoon(featureName) {
+  const toast = document.getElementById('portal-soon-toast');
+  const text = document.getElementById('portal-soon-toast-text');
+  if (!toast || !text) return;
+
+  text.innerText = '"' + featureName + '" is coming soon. We will notify you here once it is available.';
+
+  // Restart the entry animation on repeat clicks.
+  toast.classList.remove('hidden', 'animate-toast-in');
+  void toast.offsetWidth;
+  toast.classList.add('animate-toast-in');
+
+  if (typeof lucide !== 'undefined') { lucide.createIcons(); }
+
+  if (soonToastTimer) clearTimeout(soonToastTimer);
+  soonToastTimer = setTimeout(() => {
+    toast.classList.add('hidden');
+  }, 3600);
+}
+
+// Replays the staggered card entrance each time the portal is opened.
+function replayComingSoonAnimation() {
+  const cards = document.querySelectorAll('#portal-soon-grid .soon-card');
+  cards.forEach(card => {
+    card.style.animation = 'none';
+    void card.offsetWidth;
+    card.style.animation = '';
+  });
 }
 
 function closeStudentAuthModal() {
@@ -882,33 +1382,96 @@ function switchAuthTab(tab) {
   }
 }
 
-function handleStudentLogin(e) {
+async function handleStudentLogin(e) {
   e.preventDefault();
   const email = document.getElementById('login-email').value.trim().toLowerCase();
   const pass = document.getElementById('login-password').value.trim();
   const errMsg = document.getElementById('auth-error-msg');
+  const sxcMsg = document.getElementById('auth-success-msg');
 
-  if (!errMsg) return;
+  if (!errMsg || !sxcMsg) return;
   errMsg.classList.add('hidden');
+  sxcMsg.classList.add('hidden');
 
-  // Verify credentials against student array
-  const student = state.students.find(s => s.email.toLowerCase() === email && (s.password === pass || s.phone.includes(pass)));
+  if (!state.supabaseClient) {
+    errMsg.innerText = 'Supabase not configured. Please contact administrator.';
+    errMsg.classList.remove('hidden');
+    return;
+  }
 
-  if (student) {
-    state.currentSession = {
-      id: student.id,
-      email: student.email,
-      full_name: student.full_name,
-      father_name: student.father_name,
-      dob: student.dob,
-      phone: student.phone,
-      enrolled_course: student.enrolled_course
-    };
-    saveStateToLocalStorage();
-    closeStudentAuthModal();
-    openStudentPortal();
-  } else {
-    errMsg.innerText = "Incorrect email address or portal password roll number. Try 'password123' as default.";
+  try {
+    const { data, error } = await state.supabaseClient.auth.signInWithPassword({
+      email,
+      password: pass
+    });
+
+    if (error) {
+      errMsg.innerText = error.message;
+      errMsg.classList.remove('hidden');
+      return;
+    }
+
+    if (data.user && data.session) {
+      // Store session
+      state.supabaseClient.auth.setSession(data.session);
+      
+      // Debug: check if session is properly set
+      console.log('Session set, access_token:', data.session.access_token ? 'present' : 'missing');
+      console.log('User ID:', data.user.id);
+      
+      // Wait for session to fully propagate to PostgREST
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+      // Debug: verify session is active
+      const { data: { session: verifySession } } = await state.supabaseClient.auth.getSession();
+      console.log('Verified session:', verifySession ? 'active' : 'none');
+      
+      // Fetch student profile from admin_students
+      const { data: student, error: studentError } = await state.supabaseClient
+        .from('admin_students')
+        .select('*')
+        .eq('auth_id', data.user.id)
+        .single();
+
+      if (studentError || !student) {
+        console.error('Student query error:', studentError);
+        console.error('Student query error details:', JSON.stringify(studentError, null, 2));
+        // Try once more after a longer delay
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const { data: studentRetry, error: studentErrorRetry } = await state.supabaseClient
+          .from('admin_students')
+          .select('*')
+          .eq('auth_id', data.user.id)
+          .single();
+        
+        if (studentErrorRetry || !studentRetry) {
+          console.error('Student query retry error:', studentErrorRetry);
+          console.error('Student query retry error details:', JSON.stringify(studentErrorRetry, null, 2));
+          errMsg.innerText = 'Database error: ' + (studentErrorRetry?.message || 'Unknown error') + ' (Code: ' + (studentErrorRetry?.code || 'N/A') + ')';
+          errMsg.classList.remove('hidden');
+          return;
+        }
+        // Use retry result
+        student = studentRetry;
+      }
+
+      state.currentSession = {
+        id: student.id,
+        auth_id: data.user.id,
+        email: student.email,
+        full_name: student.full_name,
+        father_name: student.father_name,
+        dob: student.dob,
+        phone: student.phone,
+        enrolled_course: student.enrolled_course
+      };
+      saveStateToLocalStorage();
+
+      closeStudentAuthModal();
+      openStudentPortal();
+    }
+  } catch (err) {
+    errMsg.innerText = 'Login failed: ' + err.message;
     errMsg.classList.remove('hidden');
   }
 }
@@ -933,77 +1496,237 @@ async function handleStudentRegister(e) {
   errMsg.classList.add('hidden');
   sxcMsg.classList.add('hidden');
 
-  // Check unique email
-  if (state.students.some(s => s.email.toLowerCase() === email)) {
+  if (!state.supabaseClient) {
+    errMsg.innerText = 'Supabase not configured. Please contact administrator.';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  // Check if email already exists in admin_students
+  const { data: existingStudent } = await state.supabaseClient
+    .from('admin_students')
+    .select('id')
+    .eq('email', email)
+    .single();
+
+  if (existingStudent) {
     errMsg.innerText = "Email address is already registered. Please proceed to Login.";
     errMsg.classList.remove('hidden');
     return;
   }
 
-  const newStd = {
-    id: generateUUID(),
-    roll_number: generateRollNumber(),
-    full_name: name,
-    father_name: father,
-    dob: dob,
-    gender: gender,
-    qualification: qual,
-    residence: residence,
-    phone: phone,
-    email: email,
-    password: pass,
-    enrolled_course: document.getElementById('reg-course').value,
-    fees_paid: false,
-    fees_amount: 4500,
-    due_date: null,
-    payments: [],
-    email_verified: false,
-    enrollment_status: 'pending',
-    documents: {},
-    admin_remarks: '',
-    created_at: new Date().toISOString()
-  };
-
-  // Add locally
-  state.students.push(newStd);
-  saveStateToLocalStorage();
-
-  // Push to Supabase if active
-  if (state.supabaseClient) {
-    const { error: insertErr } = await state.supabaseClient.from('admin_students').insert([newStd]);
-    if (insertErr) {
-      console.error("Failed to register in remote database:", insertErr);
-      var errDetail = typeof insertErr === 'object' && insertErr !== null ? (insertErr.message || JSON.stringify(insertErr)) : String(insertErr);
-      if (errDetail.toLowerCase().includes('does not exist') || errDetail.toLowerCase().includes('relation')) {
-        errMsg.innerText = "REGISTRATION SAVED LOCALLY. Supabase table 'admin_students' is missing. Please run supabase-schema.sql in your Supabase SQL Editor.";
-      } else {
-        errMsg.innerText = "Registration saved locally but failed to sync to cloud: " + errDetail;
+  try {
+    // Use client-side signUp (requires email signups enabled in Supabase Auth settings)
+    const { data: authData, error: authError } = await state.supabaseClient.auth.signUp({
+      email,
+      password: pass,
+      options: {
+        data: {
+          full_name: name,
+          user_type: 'student',
+          migrated_from_legacy: false
+        }
       }
+    });
+
+    if (authError || !authData.user) {
+      // If signUp fails due to disabled signups, show helpful message
+      let msg = authError?.message || 'Unknown error';
+      if (msg.includes('User not allowed') || msg.includes('signups')) {
+        msg = 'Registration is currently disabled. Please contact administrator to enable signups in Supabase Auth settings.';
+      }
+      errMsg.innerText = 'Failed to create account: ' + msg;
       errMsg.classList.remove('hidden');
+      return;
     }
-  } else {
-    errMsg.innerText = "REGISTRATION SAVED LOCALLY. No Supabase connection — data won't appear in cloud database until you configure credentials in Supabase Config tab.";
+
+    // If email confirmation is required, user won't be logged in yet
+    if (authData.session === null) {
+      sxcMsg.innerText = 'Registration successful! Please check your email to confirm your account, then login.';
+      sxcMsg.classList.remove('hidden');
+      return;
+    }
+
+    // Create student profile linked to auth user
+    const rollNumber = await reserveRollNumber();
+    const newStd = {
+      id: generateUUID(),
+      roll_number: rollNumber,
+      full_name: name,
+      father_name: father,
+      dob: dob,
+      gender: gender,
+      qualification: qual,
+      residence: residence,
+      phone: phone,
+      email: email,
+      password: null, // No plaintext password
+      auth_id: authData.user.id,
+      enrolled_course: document.getElementById('reg-course').value,
+      fees_paid: false,
+      fees_amount: 4500,
+      due_date: null,
+      payments: [],
+      email_verified: true,
+      enrollment_status: 'pending',
+      documents: {},
+      admin_remarks: '',
+      created_at: new Date().toISOString()
+    };
+
+    const { error: insertErr } = await state.supabaseClient
+      .from('admin_students')
+      .insert([newStd]);
+
+    if (insertErr) {
+      // Rollback auth user
+      await state.supabaseClient.auth.admin.deleteUser(authData.user.id);
+      errMsg.innerText = "Failed to create student profile: " + insertErr.message;
+      errMsg.classList.remove('hidden');
+      return;
+    }
+
+    // Add locally
+    state.students.push(newStd);
+    sortStudentsByRoll();
+    saveStateToLocalStorage();
+
+    sxcMsg.innerText = "Registration successful! You can now login with your credentials.";
+    sxcMsg.classList.remove('hidden');
+
+    // Reset inputs
+    document.getElementById('reg-name').value = '';
+    document.getElementById('reg-father').value = '';
+    document.getElementById('reg-dob').value = '';
+    document.getElementById('reg-qualification').value = '';
+    document.getElementById('reg-residence').value = '';
+    document.getElementById('reg-phone').value = '';
+    document.getElementById('reg-email').value = '';
+    document.getElementById('reg-password').value = '';
+
+    // Auto-switch to login tab after 2 seconds
+    setTimeout(() => {
+      switchAuthTab('login');
+    }, 2000);
+
+  } catch (err) {
+    errMsg.innerText = 'Registration failed: ' + err.message;
     errMsg.classList.remove('hidden');
   }
-
-  sxcMsg.innerText = "Registration requested successfully! An administrator will audit your details shortly. Try logging in now.";
-  sxcMsg.classList.remove('hidden');
-
-  // Reset inputs
-  document.getElementById('reg-name').value = '';
-  document.getElementById('reg-father').value = '';
-  document.getElementById('reg-dob').value = '';
-  document.getElementById('reg-qualification').value = '';
-  document.getElementById('reg-residence').value = '';
-  document.getElementById('reg-phone').value = '';
-  document.getElementById('reg-email').value = '';
-  document.getElementById('reg-password').value = '';
 }
 
 function logoutStudentPortal() {
   state.currentSession = null;
   saveStateToLocalStorage();
   closeStudentPortal();
+  // Also sign out from Supabase Auth
+  if (state.supabaseClient) {
+    state.supabaseClient.auth.signOut();
+  }
+}
+
+// --- PASSWORD CHANGE (FIRST LOGIN / RESET) ---
+function openPasswordChangeModal() {
+  document.getElementById('password-change-modal').classList.remove('hidden');
+  document.getElementById('current-password').value = '';
+  document.getElementById('new-password').value = '';
+  document.getElementById('confirm-password').value = '';
+  document.getElementById('password-change-error').classList.add('hidden');
+  document.getElementById('password-change-success').classList.add('hidden');
+}
+
+function closePasswordChangeModal() {
+  document.getElementById('password-change-modal').classList.add('hidden');
+}
+
+async function handlePasswordChange(e) {
+  e.preventDefault();
+  const currentPass = document.getElementById('current-password').value;
+  const newPass = document.getElementById('new-password').value;
+  const confirmPass = document.getElementById('confirm-password').value;
+  const errMsg = document.getElementById('password-change-error');
+  const sxcMsg = document.getElementById('password-change-success');
+
+  if (!errMsg || !sxcMsg) return;
+  errMsg.classList.add('hidden');
+  sxcMsg.classList.add('hidden');
+
+  if (newPass !== confirmPass) {
+    errMsg.innerText = 'New passwords do not match';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  if (newPass.length < 6) {
+    errMsg.innerText = 'Password must be at least 6 characters';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  const isAdmin = state.isAdminLoggedIn === true;
+  const sessionEmail = state.currentSession?.email;
+  const sessionAuthId = state.currentSession?.auth_id;
+
+  if (!state.supabaseClient || (!sessionAuthId && !isAdmin)) {
+    errMsg.innerText = 'Session expired. Please login again.';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  try {
+    sxcMsg.innerText = 'Verifying current password...';
+    sxcMsg.classList.remove('hidden');
+
+    // Step 1: Verify current password by re-authenticating
+    const { error: signInError } = await state.supabaseClient.auth.signInWithPassword({
+      email: sessionEmail,
+      password: currentPass
+    });
+
+    if (signInError) {
+      sxcMsg.classList.add('hidden');
+      errMsg.innerText = 'Current password is incorrect';
+      errMsg.classList.remove('hidden');
+      return;
+    }
+
+    // Step 2: Current password verified — now update to new password
+    sxcMsg.innerText = 'Updating password...';
+
+    const { error: updateError } = await state.supabaseClient.auth.updateUser({
+      password: newPass
+    });
+
+    if (updateError) {
+      sxcMsg.classList.add('hidden');
+      errMsg.innerText = 'Failed to update password: ' + updateError.message;
+      errMsg.classList.remove('hidden');
+      return;
+    }
+
+    await state.supabaseClient.auth.updateUser({
+      data: { password_changed: true }
+    });
+
+    localStorage.setItem('KCTC_PASSWORD_CHANGED', 'true');
+
+    sxcMsg.innerText = 'Password updated successfully!';
+    sxcMsg.classList.remove('hidden');
+
+    setTimeout(() => {
+      closePasswordChangeModal();
+      if (state.isAdminLoggedIn) {
+        toggleAdminPanel(true);
+      } else {
+        openStudentPortal();
+      }
+    }, 1200);
+
+  } catch (err) {
+    sxcMsg.classList.add('hidden');
+    errMsg.innerText = 'Password change failed: ' + err.message;
+    errMsg.classList.remove('hidden');
+  }
 }
 
 // --- STUDENT PORTAL DOCUMENT UPLOAD ---
@@ -1016,6 +1739,56 @@ const DOC_LABELS = {
   passportPhoto: 'Passport Photo',
   signature: 'Signature'
 };
+
+// ----------------------------------------------------------------------------
+// UPLOAD RULES
+// Documents are PDF-only and capped at 200 KB so the whole document set stays
+// small enough to back up to Google Drive comfortably.
+// Image types are the exception: a passport photo / signature cannot sensibly
+// be a PDF, so those stay as images (still capped).
+//
+// To make the signature PDF-only too, just remove it from IMAGE_DOC_TYPES.
+// ----------------------------------------------------------------------------
+const DOC_MAX_BYTES = 200 * 1024;          // 200 KB
+const IMAGE_DOC_TYPES = ['passportPhoto', 'signature'];
+
+function isImageDoc(docType) {
+  return IMAGE_DOC_TYPES.indexOf(docType) !== -1;
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  return (bytes / 1024).toFixed(0) + ' KB';
+}
+
+// Returns null when the file is acceptable, otherwise an error message.
+function validateDocFile(docType, file) {
+  const imageAllowed = isImageDoc(docType);
+  const name = (file.name || '').toLowerCase();
+
+  if (imageAllowed) {
+    const okType = /^image\/(jpeg|jpg|png)$/.test(file.type) || /\.(jpe?g|png)$/.test(name);
+    if (!okType) {
+      return DOC_LABELS[docType] + ' must be a JPG or PNG image.';
+    }
+  } else {
+    const okType = file.type === 'application/pdf' || /\.pdf$/.test(name);
+    if (!okType) {
+      return DOC_LABELS[docType] + ' must be a PDF file. Please convert your document to PDF and try again.';
+    }
+  }
+
+  if (file.size > DOC_MAX_BYTES) {
+    return 'File is ' + formatBytes(file.size) + '. Maximum allowed is ' +
+           formatBytes(DOC_MAX_BYTES) + '. Please compress it and try again.';
+  }
+
+  if (file.size === 0) {
+    return 'That file appears to be empty.';
+  }
+
+  return null;
+}
 
 function getCurrentStudent() {
   const session = state.currentSession;
@@ -1033,11 +1806,13 @@ function uploadTypedDoc(docType, input) {
   if (!file) return;
   const msg = document.getElementById('portal-doc-msg');
 
-  if (file.size > 5 * 1024 * 1024) {
+  const validationError = validateDocFile(docType, file);
+  if (validationError) {
     msg.className = 'text-xs font-bold mt-1 text-red-600';
-    msg.innerText = 'File too large (max 5MB).';
+    msg.innerText = validationError;
     msg.classList.remove('hidden');
-    setTimeout(() => msg.classList.add('hidden'), 3000);
+    input.value = '';
+    setTimeout(() => msg.classList.add('hidden'), 6000);
     return;
   }
 
@@ -1065,7 +1840,10 @@ function uploadTypedDoc(docType, input) {
   // Try Supabase Storage first
   if (state.supabaseClient) {
     const ext = file.name.split('.').pop();
-    const filePath = student.id + '/' + docType + '-' + Date.now() + '.' + ext;
+    const course = (student.enrolled_course || 'Unknown').replace(' Course', '');
+    const safeName = student.full_name.replace(/[^a-zA-Z0-9 ]/g, '').trim();
+    const roll = student.roll_number || 'NO-ROLL';
+    const filePath = course + '/' + safeName + ' (' + roll + ')/' + docType + '.' + ext;
     state.supabaseClient.storage.from('student-documents').upload(filePath, file, { upsert: true }).then(function(result) {
       if (!result.error) {
         var pubRes = state.supabaseClient.storage.from('student-documents').getPublicUrl(filePath);
@@ -1146,8 +1924,13 @@ function previewTypedDoc(docType) {
   if (!student || !student.documents || !student.documents[docType]) return;
   const doc = student.documents[docType];
   const src = doc.publicUrl || doc.dataUrl;
+  const isImage = doc.type && doc.type.startsWith('image/');
   const win = window.open('', '_blank');
-  win.document.write('<html><head><title>' + doc.name + '</title></head><body style="margin:0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;"><embed src="' + src + '" style="width:100%;height:100vh;" type="' + (doc.type || 'application/pdf') + '"></embed></body></html>');
+  if (isImage) {
+    win.document.write('<html><head><title>' + doc.name + '</title></head><body style="margin:0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;min-height:100vh;"><img src="' + src + '" style="max-width:90%;max-height:90vh;object-fit:contain;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.15);"></body></html>');
+  } else {
+    win.document.write('<html><head><title>' + doc.name + '</title></head><body style="margin:0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;"><embed src="' + src + '" style="width:100%;height:100vh;" type="' + (doc.type || 'application/pdf') + '"></embed></body></html>');
+  }
   win.document.close();
 }
 
@@ -1166,33 +1949,96 @@ let chartCoursesInstance = null;
 let chartFeesInstance = null;
 
 function toggleAdminPanel(show) {
-  const publicView = document.getElementById('public-site');
-  const footerSite = document.getElementById('footer-site');
   const adminView = document.getElementById('admin-panel');
   const gate = document.getElementById('admin-pass-gate');
 
-  if (!publicView || !adminView || !gate) return;
+  // Called from the public page (index.html): there is no admin markup here,
+  // so just navigate across to the dedicated admin page.
+  if (!adminView) {
+    if (show) window.location.href = 'admin.html';
+    return;
+  }
+
+  if (!gate) return;
+
+  const adminHeader = document.getElementById('admin-header');
 
   if (show) {
     if (state.isAdminLoggedIn) {
-      publicView.classList.add('hidden');
-      if (footerSite) footerSite.classList.add('hidden');
+      gate.classList.add('hidden');
       adminView.classList.remove('hidden');
+      if (adminHeader) adminHeader.classList.remove('hidden');
       setAdminTab(state.activeAdminTab);
     } else {
+      adminView.classList.add('hidden');
+      if (adminHeader) adminHeader.classList.add('hidden');
       gate.classList.remove('hidden');
     }
   } else {
+    // Exiting admin returns to the public site.
     state.isAdminLoggedIn = false;
-    adminView.classList.add('hidden');
-    gate.classList.add('hidden');
-    publicView.classList.remove('hidden');
-    if (footerSite) footerSite.classList.remove('hidden');
-    window.scrollTo(0, 0);
+    sessionStorage.removeItem('KCTC_ADMIN_SESSION');
+    if (state.supabaseClient) {
+      state.supabaseClient.auth.signOut();
+    }
+    window.location.href = 'index.html';
   }
 }
 
-function handleAdminGatewayLogin(e) {
+// --- MOBILE SIDEBAR DRAWER ---
+// Below the lg breakpoint the sidebar is off-canvas; this slides it in/out.
+function toggleAdminSidebar(force) {
+  const sidebar = document.getElementById('admin-sidebar');
+  const backdrop = document.getElementById('admin-sidebar-backdrop');
+  const icon = document.getElementById('sidebar-toggle-icon');
+  if (!sidebar) return;
+
+  const isDesktop = window.innerWidth >= 1024;
+  const isCompact = sidebar.classList.contains('sidebar-compact');
+  const shouldCompact = (typeof force === 'boolean') ? force : !isCompact;
+
+  if (isDesktop) {
+    // Desktop: toggle compact mode (icon-only vs full)
+    sidebar.classList.toggle('sidebar-compact', shouldCompact);
+    localStorage.setItem('kctc_sidebar_compact', shouldCompact ? '1' : '0');
+    // Update toggle icon
+    if (icon) {
+      icon.setAttribute('data-lucide', shouldCompact ? 'panel-left-open' : 'panel-left-close');
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+    }
+    if (backdrop) backdrop.classList.add('hidden');
+  } else {
+    // Mobile: slide drawer in/out
+    const isOpen = !sidebar.classList.contains('-translate-x-full');
+    const shouldOpen = (typeof force === 'boolean') ? force : !isOpen;
+    if (shouldOpen) {
+      sidebar.classList.remove('-translate-x-full');
+      if (backdrop) backdrop.classList.remove('hidden');
+    } else {
+      sidebar.classList.add('-translate-x-full');
+      if (backdrop) backdrop.classList.add('hidden');
+    }
+  }
+}
+
+// Restore sidebar state from localStorage on page load
+function restoreSidebarState() {
+  const sidebar = document.getElementById('admin-sidebar');
+  const icon = document.getElementById('sidebar-toggle-icon');
+  if (!sidebar) return;
+  if (window.innerWidth >= 1024 && localStorage.getItem('kctc_sidebar_compact') === '1') {
+    sidebar.classList.add('sidebar-compact');
+    if (icon) {
+      icon.setAttribute('data-lucide', 'panel-left-open');
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+    }
+  }
+}
+
+// No longer needed — sidebar state is user-controlled
+function syncAdminSidebarToViewport() {}
+
+async function handleAdminGatewayLogin(e) {
   e.preventDefault();
   const email = document.getElementById('admin-email').value.trim().toLowerCase();
   const pass = document.getElementById('admin-password').value.trim();
@@ -1201,23 +2047,328 @@ function handleAdminGatewayLogin(e) {
   if (!errorEl) return;
   errorEl.classList.add('hidden');
 
-  // Auth check — update these credentials or configure via env variable
-  const validEmails = ['Komalpreet1625@gmail.com'.toLowerCase(), 'admin@komalcreations.com'.toLowerCase()];
-  const validPass = 'universal';
+  if (!state.supabaseClient) {
+    // Auto-enable Supabase if saved credentials exist (admin can't login without it)
+    const savedUrl = localStorage.getItem('KCTC_SUPABASE_URL') || DEFAULT_SUPABASE_URL;
+    const savedKey = localStorage.getItem('KCTC_SUPABASE_KEY') || DEFAULT_SUPABASE_KEY;
+    if (savedUrl && savedKey) {
+      state.supabaseUrl = savedUrl;
+      state.supabaseKey = savedKey;
+      initSupabaseClient();
+      updateDatabaseStatusIndicators();
+      renderDbToggle();
+    }
+    if (!state.supabaseClient) {
+      errorEl.innerText = 'Supabase not configured. Please contact administrator.';
+      errorEl.classList.remove('hidden');
+      return;
+    }
+  }
 
-  if (validEmails.includes(email) && pass === validPass) {
-    state.isAdminLoggedIn = true;
-    document.getElementById('admin-pass-gate').classList.add('hidden');
-    toggleAdminPanel(true);
-    // Reset inputs
-    document.getElementById('admin-email').value = '';
-    document.getElementById('admin-password').value = '';
-  } else {
-    errorEl.innerText = "Incorrect Administrator security credentials.";
+  try {
+    // Check if email is in admin_users table
+    const { data: adminUser, error: adminError } = await state.supabaseClient
+      .from('admin_users')
+      .select('email, auth_id')
+      .eq('email', email)
+      .single();
+
+    if (adminError || !adminUser) {
+      // Auto-create admin_users record if missing (prevents is_admin() RLS failure)
+      try {
+        const { error: insertErr } = await state.supabaseClient
+          .from('admin_users')
+          .insert({ email: email, auth_id: null });
+        if (!insertErr) {
+          adminUser = { email: email, auth_id: null };
+        } else {
+          errorEl.innerText = "Not authorized as administrator.";
+          errorEl.classList.remove('hidden');
+          return;
+        }
+      } catch (e) {
+        errorEl.innerText = "Not authorized as administrator.";
+        errorEl.classList.remove('hidden');
+        return;
+      }
+    }
+
+    // Sign in with Supabase Auth
+    const { data, error } = await state.supabaseClient.auth.signInWithPassword({
+      email,
+      password: pass
+    });
+
+    if (error) {
+      errorEl.innerText = error.message;
+      errorEl.classList.remove('hidden');
+      return;
+    }
+
+    if (data.user && data.session) {
+      // Verify this user is linked to admin_users
+      if (adminUser.auth_id && adminUser.auth_id !== data.user.id) {
+        // Link the auth user to admin_users if not linked
+        await state.supabaseClient
+          .from('admin_users')
+          .update({ auth_id: data.user.id })
+          .eq('email', email);
+      }
+
+      state.isAdminLoggedIn = true;
+      sessionStorage.setItem('KCTC_ADMIN_SESSION', '1');
+      state.supabaseClient.auth.setSession(data.session);
+      
+      // Debug
+      console.log('Admin session set, access_token:', data.session.access_token ? 'present' : 'missing');
+      console.log('Admin User ID:', data.user.id);
+      
+      // Small delay to ensure session is propagated to PostgREST
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Verify session
+      const { data: { session: verifySession } } = await state.supabaseClient.auth.getSession();
+      console.log('Admin verified session:', verifySession ? 'active' : 'none');
+      
+      // Populate currentSession for admin (needed for password change flow)
+      state.currentSession = {
+        auth_id: data.user.id,
+        email: data.user.email,
+        full_name: data.user.user_metadata?.full_name || 'Admin User',
+        isAdmin: true
+      };
+      saveStateToLocalStorage();
+      
+      // Check if admin needs to change password (first login)
+      document.getElementById('admin-pass-gate').classList.add('hidden');
+      toggleAdminPanel(true);
+
+      // Sync data from Supabase now that admin auth is active
+      await syncWithRemoteDatabase();
+      renderStudentsTable();
+      renderInquiriesTable();
+      renderCertificatesLedger();
+      renderCoursesTable();
+      updateAnalyticsDashboard();
+      populateCourseDropdowns();
+      
+      // Reset inputs
+      document.getElementById('admin-email').value = '';
+      document.getElementById('admin-password').value = '';
+    }
+  } catch (err) {
+    errorEl.innerText = 'Login failed: ' + err.message;
     errorEl.classList.remove('hidden');
   }
 }
 
+// --- ADMIN FORGOT PASSWORD ---
+function showAdminForgotPassword() {
+  document.getElementById('admin-pass-gate').classList.add('hidden');
+  document.getElementById('admin-forgot-password-modal').classList.remove('hidden');
+  document.getElementById('forgot-email').value = '';
+  document.getElementById('forgot-error').classList.add('hidden');
+  document.getElementById('forgot-success').classList.add('hidden');
+}
+
+function closeAdminForgotPassword() {
+  document.getElementById('admin-forgot-password-modal').classList.add('hidden');
+  document.getElementById('admin-pass-gate').classList.remove('hidden');
+}
+
+async function handleAdminForgotPassword(e) {
+  e.preventDefault();
+  const email = document.getElementById('forgot-email').value.trim().toLowerCase();
+  const errMsg = document.getElementById('forgot-error');
+  const sxcMsg = document.getElementById('forgot-success');
+
+  if (!errMsg || !sxcMsg) return;
+  errMsg.classList.add('hidden');
+  sxcMsg.classList.add('hidden');
+
+  if (!email) {
+    errMsg.innerText = 'Please enter your admin email';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  if (!state.supabaseClient) {
+    errMsg.innerText = 'Supabase not configured';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  try {
+    // Check if email is in admin_users table
+    const { data: adminUser, error: adminError } = await state.supabaseClient
+      .from('admin_users')
+      .select('email')
+      .eq('email', email)
+      .single();
+
+    if (adminError || !adminUser) {
+      // Don't reveal if email exists - just say email sent if it does
+      sxcMsg.innerText = 'If this email is registered as an admin, a password reset link has been sent.';
+      sxcMsg.classList.remove('hidden');
+      return;
+    }
+
+    // Send password reset email via Supabase Auth
+    const { error } = await state.supabaseClient.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin + '/admin.html'
+    });
+
+    if (error) {
+      console.error('Password reset error:', error);
+      // Don't reveal if email exists
+      sxcMsg.innerText = 'If this email is registered as an admin, a password reset link has been sent.';
+      sxcMsg.classList.remove('hidden');
+      return;
+    }
+
+    sxcMsg.innerText = 'If this email is registered as an admin, a password reset link has been sent.';
+    sxcMsg.classList.remove('hidden');
+
+  } catch (err) {
+    errMsg.innerText = 'Failed to send reset email: ' + err.message;
+    errMsg.classList.remove('hidden');
+  }
+}
+
+// --- ADMIN RECOVERY CODE SYSTEM ---
+async function generateAdminRecoveryCode() {
+  if (!state.supabaseClient || !state.isAdminLoggedIn) {
+    alert('You must be logged in as admin to generate a recovery code.');
+    return;
+  }
+
+  const email = state.currentSession?.email;
+  if (!email) {
+    alert('No admin session found.');
+    return;
+  }
+
+  if (!confirm('Generate a new recovery code? This will invalidate any previous code.\n\nSave this code somewhere safe — it can be used to reset your password if you forget it.')) {
+    return;
+  }
+
+  try {
+    const { data, error } = await state.supabaseClient.rpc('generate_admin_recovery_code', {
+      p_email: email
+    });
+
+    if (error) {
+      alert('Failed to generate code: ' + error.message);
+      return;
+    }
+
+    if (!data) {
+      alert('Failed to generate code. Make sure you are logged in as admin.');
+      return;
+    }
+
+    // Show the code in a modal/prompt
+    const code = data;
+    prompt(
+      'YOUR RECOVERY CODE (copy and save it now — shown only once!):\n\n' +
+      code + '\n\n' +
+      'Valid for 30 days. Use this to reset your admin password if locked out.',
+      code
+    );
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+}
+
+function showAdminResetWithCode() {
+  document.getElementById('admin-pass-gate').classList.add('hidden');
+  document.getElementById('admin-reset-code-modal').classList.remove('hidden');
+  document.getElementById('reset-code-email').value = '';
+  document.getElementById('reset-code-input').value = '';
+  document.getElementById('reset-code-new-pass').value = '';
+  document.getElementById('reset-code-error').classList.add('hidden');
+  document.getElementById('reset-code-success').classList.add('hidden');
+}
+
+function closeAdminResetWithCode() {
+  document.getElementById('admin-reset-code-modal').classList.add('hidden');
+  document.getElementById('admin-pass-gate').classList.remove('hidden');
+}
+
+async function handleAdminResetWithCode(e) {
+  e.preventDefault();
+  const email = document.getElementById('reset-code-email').value.trim().toLowerCase();
+  const code = document.getElementById('reset-code-input').value.trim().toUpperCase();
+  const newPass = document.getElementById('reset-code-new-pass').value;
+  const errMsg = document.getElementById('reset-code-error');
+  const sxcMsg = document.getElementById('reset-code-success');
+
+  if (!errMsg || !sxcMsg) return;
+  errMsg.classList.add('hidden');
+  sxcMsg.classList.add('hidden');
+
+  if (!email || !code || !newPass) {
+    errMsg.innerText = 'All fields are required';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  if (code.length !== 8) {
+    errMsg.innerText = 'Recovery code must be 8 characters';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  if (newPass.length < 6) {
+    errMsg.innerText = 'New password must be at least 6 characters';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  if (!state.supabaseClient) {
+    errMsg.innerText = 'Supabase not configured';
+    errMsg.classList.remove('hidden');
+    return;
+  }
+
+  try {
+    sxcMsg.innerText = 'Resetting password...';
+    sxcMsg.classList.remove('hidden');
+
+    const { data, error } = await state.supabaseClient.rpc('admin_reset_password_with_code', {
+      p_email: email,
+      p_code: code,
+      p_new_password: newPass
+    });
+
+    if (error) {
+      sxcMsg.classList.add('hidden');
+      errMsg.innerText = 'Reset failed: ' + error.message;
+      errMsg.classList.remove('hidden');
+      return;
+    }
+
+    if (!data) {
+      sxcMsg.classList.add('hidden');
+      errMsg.innerText = 'Invalid or expired recovery code. Please check and try again.';
+      errMsg.classList.remove('hidden');
+      return;
+    }
+
+    sxcMsg.innerText = 'Password reset successful! You can now login with your new password.';
+    sxcMsg.classList.remove('hidden');
+
+    setTimeout(() => {
+      closeAdminResetWithCode();
+    }, 3000);
+  } catch (err) {
+    sxcMsg.classList.add('hidden');
+    errMsg.innerText = 'Error: ' + err.message;
+    errMsg.classList.remove('hidden');
+  }
+}
+
+// --- ADMIN TAB MANAGEMENT ---
 function setAdminTab(tabId) {
   const tabs = ['analytics', 'students', 'inquiries', 'courses', 'certificates', 'db-config'];
   tabs.forEach(t => {
@@ -1233,6 +2384,10 @@ function setAdminTab(tabId) {
     if (sec) {
       if (t === tabId) {
         sec.classList.remove('hidden');
+        // Restart the entrance animation so each tab switch feels responsive.
+        sec.style.animation = 'none';
+        void sec.offsetWidth;
+        sec.style.animation = '';
       } else {
         sec.classList.add('hidden');
       }
@@ -1255,6 +2410,7 @@ function setAdminTab(tabId) {
     document.getElementById('db-config-url').value = state.supabaseUrl;
     document.getElementById('db-config-key').value = state.supabaseKey;
     document.getElementById('db-test-result').classList.add('hidden');
+    updateBackupStatusLabel();
     var badge = document.getElementById('db-env-badge');
     if (badge) {
       badge.innerText = ENV === 'dev' ? 'DEV MODE — Test Database' : 'LIVE — Production Database';
@@ -1268,15 +2424,17 @@ function setAdminTab(tabId) {
 // --- TAB SUB-VIEWS RENDERING ---
 
 function updateAnalyticsDashboard() {
+  // Analytics widgets only exist on admin.html.
+  if (!document.getElementById('stat-total-students')) return;
+
   const total = state.students.length;
   const active = state.students.filter(s => s.enrollment_status === 'accepted').length;
-  const revenue = state.students.reduce((acc, s) => acc + (s.fees_paid ? s.fees_amount : 0), 0);
   const totalCollected = state.students.reduce((acc, s) => acc + (s.payments || []).reduce((s2, p) => s2 + (p.amount || 0), 0), 0);
   const unpaidCount = state.students.filter(s => !s.fees_paid).length;
 
   document.getElementById('stat-total-students').innerText = total;
   document.getElementById('stat-active-students').innerText = active;
-  document.getElementById('stat-revenue').innerText = `₹${revenue}`;
+  document.getElementById('stat-revenue').innerText = `₹${totalCollected}`;
   document.getElementById('stat-pending-fees').innerText = unpaidCount;
 
   renderCharts();
@@ -1359,7 +2517,8 @@ function renderStudentsTable() {
   if (!tbody) return;
   tbody.innerHTML = '';
 
-  const search = document.getElementById('student-filter-search').value.trim().toLowerCase();
+  const searchEl = document.getElementById('student-filter-search');
+  const search = searchEl ? searchEl.value.trim().toLowerCase() : '';
   const filterCourse = document.getElementById('student-filter-course').value;
   const filterStatus = document.getElementById('student-filter-status').value;
 
@@ -1370,12 +2529,20 @@ function renderStudentsTable() {
     return matchSearch && matchCourse && matchStatus;
   });
 
+  // Live count: shows the filtered subset when filters are active.
+  const countLabel = document.getElementById('students-count-label');
+  if (countLabel) {
+    countLabel.innerText = filtered.length === state.students.length
+      ? 'Showing all ' + state.students.length + ' student(s)'
+      : 'Showing ' + filtered.length + ' of ' + state.students.length + ' student(s)';
+  }
+
   if (filtered.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="p-8 text-center text-slate-500 font-bold">No registered students found matching filter parameters.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="p-8 text-center text-slate-500 font-bold">No registered students found matching filter parameters.</td></tr>`;
     return;
   }
 
-  filtered.forEach(s => {
+  filtered.forEach((s, idx) => {
     const statusClass = s.enrollment_status === 'accepted' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 
                         s.enrollment_status === 'declined' ? 'bg-red-500/10 text-red-400 border border-red-500/20' : 
                         'bg-amber-500/10 text-amber-400 border border-amber-500/20';
@@ -1385,11 +2552,17 @@ function renderStudentsTable() {
     const dueDateStr = s.due_date ? new Date(s.due_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : null;
     const isOverdue = s.due_date && !s.fees_paid && new Date(s.due_date) < new Date();
 
-    const docCount = s.documents ? Object.keys(s.documents).filter(k => k !== 'selfDeclaration' && s.documents[k] && s.documents[k].dataUrl).length : 0;
+    const docCount = s.documents ? Object.keys(s.documents).filter(k => k !== 'selfDeclaration' && s.documents[k] && (s.documents[k].dataUrl || s.documents[k].publicUrl)).length : 0;
 
     const tr = document.createElement('tr');
     tr.className = "border-b border-slate-800 hover:bg-slate-950/40 transition-all";
     tr.innerHTML = `
+      <td class="p-3.5 text-center align-top">
+        <input type="checkbox" data-student-id="${s.id}" class="student-checkbox w-3.5 h-3.5 accent-[#c5a059] cursor-pointer">
+      </td>
+      <td class="p-3.5 text-center align-top">
+        <span class="inline-flex items-center justify-center w-6 h-6 rounded-lg bg-slate-900 border border-slate-800 text-[10px] font-black text-[#c5a059]">${idx + 1}</span>
+      </td>
       <td class="p-3.5">
         <strong class="block text-white font-serif text-sm">${s.full_name}</strong>
         <span class="text-[10px] text-slate-500 font-bold uppercase mt-1 block">${s.roll_number || '—'}</span>
@@ -1403,16 +2576,21 @@ function renderStudentsTable() {
         ${s.enrolled_course.replace(" Course", "")}
       </td>
       <td class="p-3.5">
-        <div class="flex items-center gap-2 flex-wrap">
-          <span class="px-2.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider ${statusClass}">${s.enrollment_status.toUpperCase()}</span>
-          <span class="px-2.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider ${feesClass}">₹${s.fees_amount} ${s.fees_paid ? 'PAID' : 'UNPAID'}</span>
-          ${dueDateStr ? `<span class="text-[9px] font-bold ${isOverdue ? 'text-red-400' : 'text-slate-500'}">Due: ${dueDateStr}</span>` : ''}
-        </div>
-        <div class="flex items-center gap-1 mt-1.5">
-          <span class="font-mono text-[10px] text-[#c5a059]">Pass: ${s.password || 'password123'}</span>
-          <button onclick="adminOpenPaymentHistory('${s.id}')" class="ml-2 px-2 py-0.5 bg-slate-800 hover:bg-emerald-800 rounded text-[9px] text-slate-300 font-bold transition-all">₹ Payments</button>
-        </div>
-      </td>
+         <div class="flex items-center gap-2 flex-wrap">
+           <span class="px-2.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider ${statusClass}">${s.enrollment_status.toUpperCase()}</span>
+           <span class="px-2.5 py-0.5 rounded-full text-[9px] font-bold tracking-wider ${feesClass}">₹${s.fees_amount} ${s.fees_paid ? 'PAID' : 'UNPAID'}</span>
+           ${dueDateStr ? `<span class="text-[9px] font-bold ${isOverdue ? 'text-red-400' : 'text-slate-500'}">Due: ${dueDateStr}</span>` : ''}
+         </div>
+         <div class="flex items-center gap-1 mt-1.5">
+           <span class="font-mono text-[10px] text-[#c5a059]">Auth: ${s.auth_id ? 'Supabase Linked' : 'Not Linked'}</span>
+           <button onclick="adminOpenPaymentHistory('${s.id}')" class="ml-2 px-2 py-0.5 bg-slate-800 hover:bg-emerald-900 rounded text-[9px] text-slate-300 hover:text-emerald-400 font-bold transition-all" title="Manage payments">
+             <i data-lucide="indian-rupee" class="w-3 h-3 inline mr-1"></i>Payments
+           </button>
+           <button onclick="adminResetStudentPassword('${s.id}', '${s.email}')" class="px-2 py-0.5 bg-slate-800 hover:bg-[#501537] rounded text-[9px] text-slate-300 hover:text-[#c5a059] font-bold transition-all" title="Reset student portal password">
+             <i data-lucide="key" class="w-3 h-3 inline mr-1"></i>Reset
+           </button>
+         </div>
+       </td>
       <td class="p-3.5">
         <button onclick="adminPreviewDocs('${s.id}')" class="px-2.5 py-1.5 bg-slate-900 hover:bg-[#501537] rounded-lg text-slate-400 hover:text-white text-[10px] font-bold transition-all border border-slate-800 flex items-center gap-1.5">
           <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
@@ -1443,6 +2621,7 @@ function renderStudentsTable() {
         </button>
       </td>
     `;
+    tr.style.animationDelay = (idx * 35) + 'ms';
     tbody.appendChild(tr);
   });
   if (typeof lucide !== 'undefined') { lucide.createIcons(); }
@@ -1453,18 +2632,26 @@ function renderInquiriesTable() {
   if (!tbody) return;
   tbody.innerHTML = '';
 
-  const search = document.getElementById('inquiry-filter-search').value.trim().toLowerCase();
+  const searchEl = document.getElementById('inquiry-filter-search');
+  const search = searchEl ? searchEl.value.trim().toLowerCase() : '';
 
   const filtered = state.inquiries.filter(i => {
     return i.full_name.toLowerCase().includes(search) || i.phone_number.includes(search) || (i.course_interested && i.course_interested.toLowerCase().includes(search));
   });
 
+  const countLabel = document.getElementById('inquiries-count-label');
+  if (countLabel) {
+    countLabel.innerText = filtered.length === state.inquiries.length
+      ? 'Showing all ' + state.inquiries.length + ' lead(s)'
+      : 'Showing ' + filtered.length + ' of ' + state.inquiries.length + ' lead(s)';
+  }
+
   if (filtered.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-slate-500 font-bold">No inquiry leads logged.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6" class="p-8 text-center text-slate-500 font-bold">No inquiry leads logged.</td></tr>`;
     return;
   }
 
-  filtered.forEach(inq => {
+  filtered.forEach((inq, idx) => {
     const dateStr = new Date(inq.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
     
     const statusClass = inq.status === 'enrolled' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 
@@ -1475,6 +2662,9 @@ function renderInquiriesTable() {
     const tr = document.createElement('tr');
     tr.className = "border-b border-slate-800 hover:bg-slate-950/40 transition-all";
     tr.innerHTML = `
+      <td class="p-3.5 text-center align-top">
+        <span class="inline-flex items-center justify-center w-6 h-6 rounded-lg bg-slate-900 border border-slate-800 text-[10px] font-black text-[#c5a059]">${idx + 1}</span>
+      </td>
       <td class="p-3.5 text-slate-500 font-semibold">${dateStr}</td>
       <td class="p-3.5">
         <strong class="block text-white font-medium">${inq.full_name}</strong>
@@ -1502,6 +2692,7 @@ function renderInquiriesTable() {
         </button>
       </td>
     `;
+    tr.style.animationDelay = (idx * 35) + 'ms';
     tbody.appendChild(tr);
   });
   if (typeof lucide !== 'undefined') { lucide.createIcons(); }
@@ -1631,8 +2822,13 @@ function adminOpenDoc(studentId, docType) {
   if (!student || !student.documents || !student.documents[docType]) return;
   const doc = student.documents[docType];
   const src = doc.publicUrl || doc.dataUrl;
+  const isImage = doc.type && doc.type.startsWith('image/');
   const win = window.open('', '_blank');
-  win.document.write('<html><head><title>' + doc.name + '</title></head><body style="margin:0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;"><embed src="' + src + '" style="width:100%;height:100vh;" type="' + (doc.type || 'application/pdf') + '"></embed></body></html>');
+  if (isImage) {
+    win.document.write('<html><head><title>' + doc.name + '</title></head><body style="margin:0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;min-height:100vh;"><img src="' + src + '" style="max-width:90%;max-height:90vh;object-fit:contain;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.15);"></body></html>');
+  } else {
+    win.document.write('<html><head><title>' + doc.name + '</title></head><body style="margin:0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;"><embed src="' + src + '" style="width:100%;height:100vh;" type="' + (doc.type || 'application/pdf') + '"></embed></body></html>');
+  }
   win.document.close();
 }
 
@@ -1663,6 +2859,108 @@ async function adminSaveRemark(studentId) {
   renderStudentsTable();
 }
 
+// --- ADMIN: RESET STUDENT PASSWORD ---
+let adminResetTargetEmail = '';
+let adminResetTargetAuthId = '';
+
+function adminResetStudentPassword(studentId, studentEmail) {
+  const student = state.students.find(s => s.id === studentId);
+  adminResetTargetEmail = studentEmail;
+  adminResetTargetAuthId = student ? (student.auth_id || '') : '';
+  const modal = document.getElementById('admin-reset-password-modal');
+  const emailEl = document.getElementById('reset-password-email');
+  const newPassEl = document.getElementById('reset-password-new');
+  const errEl = document.getElementById('reset-password-error');
+  const sxcEl = document.getElementById('reset-password-success');
+  if (emailEl) emailEl.value = studentEmail;
+  if (newPassEl) newPassEl.value = '';
+  if (errEl) errEl.classList.add('hidden');
+  if (sxcEl) sxcEl.classList.add('hidden');
+  if (modal) modal.classList.remove('hidden');
+}
+
+function closeAdminResetPasswordModal() {
+  const modal = document.getElementById('admin-reset-password-modal');
+  if (modal) modal.classList.add('hidden');
+  adminResetTargetEmail = '';
+  adminResetTargetAuthId = '';
+}
+
+async function handleAdminResetPassword(e) {
+  e.preventDefault();
+  const newPass = document.getElementById('reset-password-new').value;
+  const confirmPass = document.getElementById('reset-password-confirm').value;
+  const errEl = document.getElementById('reset-password-error');
+  const sxcEl = document.getElementById('reset-password-success');
+
+  if (!errEl || !sxcEl) return;
+  errEl.classList.add('hidden');
+  sxcEl.classList.add('hidden');
+
+  if (!newPass || newPass.length < 6) {
+    errEl.innerText = 'Password must be at least 6 characters';
+    errEl.classList.remove('hidden');
+    return;
+  }
+  if (newPass !== confirmPass) {
+    errEl.innerText = 'Passwords do not match';
+    errEl.classList.remove('hidden');
+    return;
+  }
+
+  try {
+    const email = adminResetTargetEmail;
+
+    sxcEl.innerText = 'Resetting password...';
+    sxcEl.classList.remove('hidden');
+
+    const { data, error } = await state.supabaseClient
+      .rpc('admin_reset_student_password', {
+        p_email: email,
+        p_new_password: newPass
+      });
+
+    if (error) {
+      sxcEl.classList.add('hidden');
+      errEl.innerText = 'Failed: ' + error.message;
+      errEl.classList.remove('hidden');
+      return;
+    }
+
+    if (data === false) {
+      sxcEl.classList.add('hidden');
+      errEl.innerText = 'Reset failed. Check that the student email exists in auth.users and you have admin access.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+
+    sxcEl.innerText = 'Password reset successfully for ' + email;
+    sxcEl.classList.remove('hidden');
+    setTimeout(() => closeAdminResetPasswordModal(), 2000);
+
+  } catch (err) {
+    sxcEl.classList.add('hidden');
+    errEl.innerText = 'Error: ' + err.message;
+    errEl.classList.remove('hidden');
+  }
+}
+
+async function adminSendPasswordResetEmail(studentEmail) {
+  if (!state.supabaseClient) return alert('Supabase not configured');
+  try {
+    const { error } = await state.supabaseClient.auth.resetPasswordForEmail(studentEmail, {
+      redirectTo: window.location.origin + '/index.html'
+    });
+    if (error) {
+      alert('Failed to send reset email: ' + error.message);
+    } else {
+      alert('Password reset email sent to ' + studentEmail);
+    }
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+}
+
 function adminOpenPaymentHistory(studentId) {
   const student = state.students.find(s => s.id === studentId);
   if (!student) return;
@@ -1672,13 +2970,31 @@ function adminOpenPaymentHistory(studentId) {
 
   const overlay = document.createElement('div');
   overlay.id = 'admin-payment-overlay';
-  overlay.className = 'fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4';
+  overlay.className = 'fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto';
   overlay.onclick = function(e) { if (e.target === overlay) overlay.remove(); };
 
+  // Each row is an inline editable form so a wrong amount can be corrected.
   var rows = payments.length === 0 ? '<p class="text-slate-500 text-xs text-center py-4">No payments recorded yet.</p>' :
     payments.map(function(p, i) {
-      var dateStr = new Date(p.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
-      return '<div class="flex items-center justify-between bg-slate-900 p-3 rounded-xl border border-slate-800"><div><span class="text-emerald-400 font-bold text-sm">₹' + p.amount + '</span><span class="text-slate-500 text-[10px] ml-2">' + dateStr + '</span></div><div class="text-right"><span class="text-slate-300 text-[10px] font-bold uppercase">' + (p.method || 'Cash') + '</span>' + (p.note ? '<span class="text-slate-500 text-[9px] block">' + p.note + '</span>' : '') + '</div></div>';
+      var methods = ['Cash', 'UPI', 'Bank Transfer'];
+      var opts = methods.map(function(m) {
+        return '<option value="' + m + '"' + ((p.method || 'Cash') === m ? ' selected' : '') + '>' + m + '</option>';
+      }).join('');
+      var safeNote = String(p.note || '').replace(/"/g, '&quot;');
+      return '' +
+        '<div class="bg-slate-900 p-3 rounded-xl border border-slate-800 flex flex-col gap-2">' +
+          '<div class="flex items-center gap-2">' +
+            '<span class="text-[9px] font-bold text-slate-500 uppercase w-10 shrink-0">#' + (i + 1) + '</span>' +
+            '<input type="number" id="edit-pay-amount-' + i + '" value="' + (p.amount || 0) + '" class="w-24 px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-xs text-emerald-400 font-bold outline-none focus:border-emerald-500">' +
+            '<input type="date" id="edit-pay-date-' + i + '" value="' + (p.date || '') + '" class="px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-[11px] text-slate-200 outline-none focus:border-emerald-500">' +
+            '<select id="edit-pay-method-' + i + '" class="px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-[11px] text-slate-200 outline-none">' + opts + '</select>' +
+          '</div>' +
+          '<div class="flex items-center gap-2">' +
+            '<input type="text" id="edit-pay-note-' + i + '" value="' + safeNote + '" placeholder="Note" class="flex-grow px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-[11px] text-slate-300 outline-none focus:border-emerald-500">' +
+            '<button onclick="adminUpdatePayment(\'' + studentId + '\', ' + i + ')" class="px-3 py-1 bg-[#501537] hover:bg-[#c5a059] text-white text-[10px] font-bold rounded-lg transition-all whitespace-nowrap">Save</button>' +
+            '<button onclick="adminDeletePayment(\'' + studentId + '\', ' + i + ')" class="px-3 py-1 bg-slate-950 hover:bg-red-950 text-slate-500 hover:text-red-400 border border-slate-800 hover:border-red-900 text-[10px] font-bold rounded-lg transition-all">Delete</button>' +
+          '</div>' +
+        '</div>';
     }).join('');
 
   overlay.innerHTML = `
@@ -1691,11 +3007,18 @@ function adminOpenPaymentHistory(studentId) {
           <i data-lucide="indian-rupee" class="w-5 h-5 text-emerald-400"></i>
           <span>Payment History — ${student.full_name}</span>
         </h2>
-        <p class="text-xs text-slate-400 mt-1">Roll: ${student.roll_number || '—'} | Total Fee: ₹${student.fees_amount} | Paid: ₹${totalPaid} | Due: ₹${Math.max(0, due)}</p>
+        <p class="text-xs text-slate-400 mt-1">Roll: ${student.roll_number || '—'} | Paid: <strong class="text-emerald-400">₹${totalPaid}</strong> | Pending: <strong class="${due > 0 ? 'text-red-400' : 'text-emerald-400'}">₹${Math.max(0, due)}</strong></p>
+        <div class="flex items-center gap-2 mt-3">
+          <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Total Fee</label>
+          <input type="number" id="edit-total-fee" value="${student.fees_amount}" class="w-28 px-2 py-1 bg-slate-900 border border-slate-800 rounded-lg text-xs text-white outline-none focus:border-[#c5a059]">
+          <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-2">Due Date</label>
+          <input type="date" id="edit-fee-due-date" value="${student.due_date || ''}" class="px-2 py-1 bg-slate-900 border border-slate-800 rounded-lg text-xs text-white outline-none focus:border-[#c5a059]">
+          <button onclick="adminUpdateFeeTerms('${studentId}')" class="px-3 py-1 bg-[#501537] hover:bg-[#c5a059] text-white text-[10px] font-bold rounded-lg transition-all">Update</button>
+        </div>
       </div>
       <div class="p-6 flex flex-col gap-3 max-h-[350px] overflow-y-auto">${rows}</div>
-      <div class="p-4 border-t border-slate-800 flex gap-2">
-        <input type="number" id="payment-amount-input" placeholder="Amount" class="w-28 px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-emerald-500">
+      <div class="p-4 border-t border-slate-800 flex flex-wrap gap-2">
+        <input type="number" id="payment-amount-input" placeholder="Amount" class="w-24 sm:w-28 px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-emerald-500">
         <input type="date" id="payment-date-input" class="px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-emerald-500">
         <select id="payment-method-input" class="px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-200 outline-none">
           <option value="Cash">Cash</option>
@@ -1711,6 +3034,88 @@ function adminOpenPaymentHistory(studentId) {
   if (typeof lucide !== 'undefined') lucide.createIcons();
 }
 
+// Recomputes the paid flag from the payment ledger. Kept in one place so the
+// add / edit / delete paths can never disagree with each other.
+function recalcStudentFees(student) {
+  if (!student.payments) student.payments = [];
+  const totalPaid = student.payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+  student.fees_paid = totalPaid >= (student.fees_amount || 0);
+  return totalPaid;
+}
+
+async function persistStudent(student) {
+  saveStateToLocalStorage();
+  if (state.supabaseClient) {
+    const { error: saveErr } = await state.supabaseClient.from('admin_students').upsert([student]);
+    if (saveErr) {
+      console.error('Failed to sync payment change:', saveErr);
+      alert('Saved locally but failed to sync to cloud: ' + (saveErr.message || String(saveErr)));
+    }
+  }
+}
+
+async function adminUpdatePayment(studentId, index) {
+  const student = state.students.find(s => s.id === studentId);
+  if (!student || !student.payments || !student.payments[index]) return;
+
+  const amountEl = document.getElementById('edit-pay-amount-' + index);
+  const amount = parseInt(amountEl ? amountEl.value : '', 10);
+  if (!amount || amount <= 0) { alert('Enter a valid amount greater than zero.'); return; }
+
+  const dateEl = document.getElementById('edit-pay-date-' + index);
+  const methodEl = document.getElementById('edit-pay-method-' + index);
+  const noteEl = document.getElementById('edit-pay-note-' + index);
+
+  student.payments[index] = {
+    amount: amount,
+    date: (dateEl && dateEl.value) ? dateEl.value : new Date().toISOString().split('T')[0],
+    method: methodEl ? methodEl.value : 'Cash',
+    note: noteEl ? noteEl.value.trim() : ''
+  };
+
+  recalcStudentFees(student);
+  await persistStudent(student);
+  renderStudentsTable();
+  updateAnalyticsDashboard();
+  adminOpenPaymentHistory(studentId);
+}
+
+async function adminDeletePayment(studentId, index) {
+  const student = state.students.find(s => s.id === studentId);
+  if (!student || !student.payments || !student.payments[index]) return;
+
+  const entry = student.payments[index];
+  if (!confirm('Delete this payment of ₹' + (entry.amount || 0) + '? This cannot be undone.')) return;
+
+  student.payments.splice(index, 1);
+  recalcStudentFees(student);
+  await persistStudent(student);
+  renderStudentsTable();
+  updateAnalyticsDashboard();
+  adminOpenPaymentHistory(studentId);
+}
+
+// Corrects the total course fee and/or the due date.
+async function adminUpdateFeeTerms(studentId) {
+  const student = state.students.find(s => s.id === studentId);
+  if (!student) return;
+
+  const feeEl = document.getElementById('edit-total-fee');
+  const dueEl = document.getElementById('edit-fee-due-date');
+
+  const fee = parseInt(feeEl ? feeEl.value : '', 10);
+  if (isNaN(fee) || fee < 0) { alert('Enter a valid total fee.'); return; }
+
+  student.fees_amount = fee;
+  student.due_date = (dueEl && dueEl.value) ? dueEl.value : null;
+
+  recalcStudentFees(student);
+  await persistStudent(student);
+  renderStudentsTable();
+  updateAnalyticsDashboard();
+  adminOpenPaymentHistory(studentId);
+}
+
 function adminAddPayment(studentId) {
   const student = state.students.find(s => s.id === studentId);
   if (!student) return;
@@ -1721,16 +3126,472 @@ function adminAddPayment(studentId) {
   const note = document.getElementById('payment-note-input').value.trim();
   if (!student.payments) student.payments = [];
   student.payments.push({ amount: amount, date: date, method: method, note: note });
-  const totalPaid = student.payments.reduce((s, p) => s + p.amount, 0);
-  student.fees_paid = totalPaid >= student.fees_amount;
-  student.fees_amount = Math.max(student.fees_amount, totalPaid);
-  saveStateToLocalStorage();
-  if (state.supabaseClient) {
-    state.supabaseClient.from('admin_students').upsert([student]).then(function(r) { if (r.error) console.error(r.error); });
-  }
+  recalcStudentFees(student);
+  persistStudent(student);
   renderStudentsTable();
   updateAnalyticsDashboard();
   adminOpenPaymentHistory(studentId);
+}
+
+// ============================================================================
+// BACKUP & RESTORE
+// Full JSON snapshot of every table. Use before any risky operation and on a
+// regular schedule. Restore is additive-by-default so it cannot silently
+// destroy records that exist in the cloud but not in the backup file.
+// ============================================================================
+
+function buildBackupObject() {
+  return {
+    kctc_backup_version: 1,
+    exported_at: new Date().toISOString(),
+    environment: ENV,
+    supabase_url: state.supabaseUrl,
+    counts: {
+      students: state.students.length,
+      inquiries: state.inquiries.length,
+      certificates: state.certificates.length,
+      courses: state.courses.length
+    },
+    students: state.students,
+    inquiries: state.inquiries,
+    certificates: state.certificates,
+    courses: state.courses
+  };
+}
+
+// ============================================================================
+// GOOGLE DRIVE SYNC
+//
+// SECURITY NOTE — why this is admin-triggered and not automatic:
+// This site is static, with no backend. Uploading to Drive automatically the
+// moment a student picks a file would require credentials that every anonymous
+// visitor could read from script.js. A service-account key in client-side code
+// would hand anyone full control of the Drive.
+//
+// Instead the ADMIN connects their own Google account. The token lives only in
+// this browser tab's memory, expires in ~1 hour, and uses the 'drive.file'
+// scope, which grants access ONLY to files this app itself creates — it cannot
+// read or touch anything else in the Drive.
+//
+// The OAuth Client ID is public by design; it is not a secret.
+// Folder layout:  KCTC Student Documents / <Course> / <Student Name> / <file>
+// ============================================================================
+
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_ROOT_FOLDER = 'KCTC Student Documents';
+
+let driveTokenClient = null;
+let driveAccessToken = null;
+const driveFolderCache = {};
+
+function getDriveClientId() {
+  return localStorage.getItem('KCTC_DRIVE_CLIENT_ID') || '';
+}
+
+function saveDriveClientId() {
+  const el = document.getElementById('drive-client-id');
+  const id = el ? el.value.trim() : '';
+  if (!id) { alert('Enter your Google OAuth Client ID first.'); return; }
+  localStorage.setItem('KCTC_DRIVE_CLIENT_ID', id);
+  driveTokenClient = null;
+  updateDriveStatus('Client ID saved. Now click "Connect Google Drive".', 'ok');
+}
+
+function updateDriveStatus(text, kind) {
+  const el = document.getElementById('drive-status');
+  if (!el) return;
+  const colour = kind === 'ok' ? 'text-emerald-400'
+               : kind === 'warn' ? 'text-amber-400'
+               : kind === 'err' ? 'text-red-400'
+               : 'text-slate-400';
+  el.className = 'text-[11px] font-bold mt-2 ' + colour;
+  el.innerText = text;
+}
+
+// Opens Google's consent screen and stores the token in memory only.
+function connectGoogleDrive() {
+  const clientId = getDriveClientId();
+  if (!clientId) { alert('Save your Google OAuth Client ID first.'); return; }
+
+  if (typeof google === 'undefined' || !google.accounts || !google.accounts.oauth2) {
+    updateDriveStatus('Google sign-in library did not load. Check your internet connection.', 'err');
+    return;
+  }
+
+  if (!driveTokenClient) {
+    driveTokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: DRIVE_SCOPE,
+      callback: function (resp) {
+        if (resp && resp.access_token) {
+          driveAccessToken = resp.access_token;
+          updateDriveStatus('Connected to Google Drive. Token valid for about 1 hour.', 'ok');
+        } else {
+          updateDriveStatus('Could not obtain access token.', 'err');
+        }
+      },
+      error_callback: function (err) {
+        updateDriveStatus('Google sign-in failed: ' + (err && err.type ? err.type : 'unknown'), 'err');
+      }
+    });
+  }
+  driveTokenClient.requestAccessToken({ prompt: '' });
+}
+
+function driveHeaders() {
+  return { Authorization: 'Bearer ' + driveAccessToken };
+}
+
+// Finds a folder by name under a parent, creating it if absent.
+async function driveFindOrCreateFolder(name, parentId) {
+  const cacheKey = (parentId || 'root') + '/' + name;
+  if (driveFolderCache[cacheKey]) return driveFolderCache[cacheKey];
+
+  const safeName = String(name).replace(/'/g, "\\'");
+  let q = "mimeType='application/vnd.google-apps.folder' and trashed=false and name='" + safeName + "'";
+  q += parentId ? " and '" + parentId + "' in parents" : " and 'root' in parents";
+
+  const listUrl = 'https://www.googleapis.com/drive/v3/files?q=' +
+                  encodeURIComponent(q) + '&fields=files(id,name)&pageSize=1';
+
+  const listRes = await fetch(listUrl, { headers: driveHeaders() });
+  if (!listRes.ok) throw new Error('Drive list failed (' + listRes.status + ')');
+  const listData = await listRes.json();
+
+  if (listData.files && listData.files.length > 0) {
+    driveFolderCache[cacheKey] = listData.files[0].id;
+    return listData.files[0].id;
+  }
+
+  const metadata = {
+    name: name,
+    mimeType: 'application/vnd.google-apps.folder',
+    parents: parentId ? [parentId] : undefined
+  };
+  const createRes = await fetch('https://www.googleapis.com/drive/v3/files?fields=id', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, driveHeaders()),
+    body: JSON.stringify(metadata)
+  });
+  if (!createRes.ok) throw new Error('Drive folder create failed (' + createRes.status + ')');
+  const created = await createRes.json();
+  driveFolderCache[cacheKey] = created.id;
+  return created.id;
+}
+
+// Multipart upload of a Blob into a given folder.
+async function driveUploadBlob(blob, fileName, folderId) {
+  const boundary = '-------kctc' + Date.now();
+  const metadata = { name: fileName, parents: [folderId] };
+
+  const body = new Blob([
+    '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n',
+    JSON.stringify(metadata),
+    '\r\n--' + boundary + '\r\nContent-Type: ' + (blob.type || 'application/octet-stream') + '\r\n\r\n',
+    blob,
+    '\r\n--' + boundary + '--'
+  ]);
+
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'multipart/related; boundary=' + boundary }, driveHeaders()),
+    body: body
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error('Upload failed (' + res.status + '): ' + txt.slice(0, 120));
+  }
+  return res.json();
+}
+
+// Turns a stored document record into a Blob, whether it lives in Supabase
+// Storage (publicUrl) or inline as base64 (dataUrl).
+async function documentToBlob(doc) {
+  if (doc.publicUrl) {
+    const res = await fetch(doc.publicUrl);
+    if (!res.ok) throw new Error('Could not fetch from storage (' + res.status + ')');
+    return res.blob();
+  }
+  if (doc.dataUrl) {
+    const res = await fetch(doc.dataUrl);
+    return res.blob();
+  }
+  throw new Error('No file content available');
+}
+
+// Builds Course / Student / file and uploads every document.
+async function syncDocumentsToDrive() {
+  if (!driveAccessToken) { alert('Connect Google Drive first.'); return; }
+
+  const docs = collectStudentDocuments().filter(d => d.url || d.inlineOnly);
+  if (docs.length === 0) { alert('No documents to sync.'); return; }
+
+  if (!confirm('Upload ' + docs.length + ' document(s) to Google Drive?\n\n' +
+               'Folder structure:\n' + DRIVE_ROOT_FOLDER + ' / Course / Student Name / file')) return;
+
+  updateDriveStatus('Starting sync...', 'warn');
+
+  let ok = 0, failed = 0;
+  const errors = [];
+
+  try {
+    const rootId = await driveFindOrCreateFolder(DRIVE_ROOT_FOLDER, null);
+
+    for (let i = 0; i < docs.length; i++) {
+      const d = docs[i];
+      updateDriveStatus('Uploading ' + (i + 1) + ' of ' + docs.length + ': ' + d.student + ' / ' + d.type, 'warn');
+
+      try {
+        const student = state.students.find(s => s.full_name === d.student && (s.roll_number || '') === d.roll);
+        const course = (student && student.enrolled_course) ? student.enrolled_course : 'Unassigned Course';
+        const studentFolderName = d.roll ? (d.student + ' (' + d.roll + ')') : d.student;
+
+        const courseId = await driveFindOrCreateFolder(course, rootId);
+        const studentId = await driveFindOrCreateFolder(studentFolderName, courseId);
+
+        const raw = (student && student.documents) ? student.documents[d.type] : null;
+        if (!raw) throw new Error('Document record missing');
+
+        const blob = await documentToBlob(raw);
+        const ext = (d.name.split('.').pop() || 'bin').toLowerCase();
+        const fileName = d.type + '.' + ext;
+
+        await driveUploadBlob(blob, fileName, studentId);
+        ok++;
+      } catch (err) {
+        failed++;
+        errors.push(d.student + ' / ' + d.type + ': ' + (err.message || err));
+      }
+    }
+  } catch (err) {
+    updateDriveStatus('Sync aborted: ' + (err.message || err), 'err');
+    alert('Sync aborted: ' + (err.message || err));
+    return;
+  }
+
+  updateDriveStatus('Sync finished — ' + ok + ' uploaded, ' + failed + ' failed.', failed ? 'warn' : 'ok');
+  alert('Google Drive sync complete.\n\nUploaded: ' + ok + '\nFailed: ' + failed +
+        (errors.length ? '\n\nFirst errors:\n' + errors.slice(0, 5).join('\n') : ''));
+}
+
+// ----------------------------------------------------------------------------
+// DOCUMENT AUDIT + DOWNLOAD
+// Uploaded files live in Supabase Storage; the JSON backup only stores their
+// URLs. If the project is deleted those URLs die, so the actual files must be
+// pulled down separately. This lists them and downloads them one by one.
+// ----------------------------------------------------------------------------
+function collectStudentDocuments() {
+  const out = [];
+  state.students.forEach(s => {
+    const docs = s.documents || {};
+    Object.keys(docs).forEach(type => {
+      if (type === 'selfDeclaration') return;
+      const d = docs[type];
+      if (!d) return;
+      out.push({
+        student: s.full_name,
+        roll: s.roll_number || '',
+        type: type,
+        name: d.name || (type + '.file'),
+        url: d.publicUrl || '',
+        inlineOnly: !d.publicUrl && !!d.dataUrl,
+        path: d.path || ''
+      });
+    });
+  });
+  return out;
+}
+
+function auditStudentDocuments() {
+  const docs = collectStudentDocuments();
+  const box = document.getElementById('docs-audit-result');
+  if (!box) return;
+
+  if (docs.length === 0) {
+    box.classList.remove('hidden');
+    box.innerHTML = '<span class="text-slate-400 text-[11px]">No uploaded documents found.</span>';
+    return;
+  }
+
+  const cloud = docs.filter(d => d.url).length;
+  const inline = docs.filter(d => d.inlineOnly).length;
+
+  box.classList.remove('hidden');
+  box.innerHTML =
+    '<div class="text-[11px] leading-relaxed">' +
+    '<strong class="text-[#c5a059]">' + docs.length + ' document(s) found</strong><br>' +
+    '<span class="text-amber-400">' + cloud + '</span> stored in Supabase Storage — <strong>NOT inside the JSON backup</strong><br>' +
+    '<span class="text-emerald-400">' + inline + '</span> stored inline (base64) — these ARE inside the JSON backup<br><br>' +
+    (cloud > 0
+      ? '<span class="text-amber-400">The ' + cloud + ' cloud file(s) must be downloaded separately. ' +
+        'If this Supabase project is deleted, those links stop working permanently.</span>'
+      : '<span class="text-emerald-400">All documents are inside your JSON backup.</span>') +
+    '</div>';
+}
+
+// Downloads a CSV manifest of every document plus its URL.
+function exportDocumentManifest() {
+  const docs = collectStudentDocuments();
+  if (docs.length === 0) { alert('No documents to export.'); return; }
+  const headers = ['Student', 'Roll Number', 'Doc Type', 'File Name', 'Storage Path', 'Public URL', 'Inline Only'];
+  const rows = docs.map(d => [d.student, d.roll, d.type, d.name, d.path, d.url, d.inlineOnly ? 'YES' : 'no']);
+  downloadCSV('KCTC_DOCUMENT_MANIFEST_' + new Date().toISOString().split('T')[0] + '.csv', headers, rows);
+}
+
+// Opens each cloud-stored document so the browser saves it locally.
+async function downloadAllDocuments() {
+  const docs = collectStudentDocuments().filter(d => d.url);
+  if (docs.length === 0) { alert('No cloud-stored documents to download.'); return; }
+  if (!confirm('Download ' + docs.length + ' file(s)?\n\nYour browser may ask permission to download multiple files. Allow it.')) return;
+
+  let ok = 0;
+  for (const d of docs) {
+    try {
+      const res = await fetch(d.url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const blob = await res.blob();
+      const safe = (d.roll || d.student).replace(/[^a-z0-9\-_]/gi, '_');
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = safe + '__' + d.type + '__' + d.name;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      ok++;
+      await new Promise(r => setTimeout(r, 400));
+    } catch (err) {
+      console.error('Failed to download ' + d.name + ':', err);
+    }
+  }
+  alert('Downloaded ' + ok + ' of ' + docs.length + ' file(s).' +
+        (ok < docs.length ? '\n\nSome failed — check the browser console.' : ''));
+}
+
+function downloadFullBackup(reason) {
+  const backup = buildBackupObject();
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const tag = reason ? '_' + reason : '';
+  const name = 'KCTC_BACKUP_' + ENV.toUpperCase() + tag + '_' + stamp + '.json';
+
+  const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(link.href);
+
+  try {
+    localStorage.setItem('KCTC_LAST_BACKUP_AT', backup.exported_at);
+  } catch (e) { /* storage full — not fatal */ }
+
+  updateBackupStatusLabel();
+  return name;
+}
+
+function updateBackupStatusLabel() {
+  const el = document.getElementById('backup-status-label');
+  if (!el) return;
+  const last = localStorage.getItem('KCTC_LAST_BACKUP_AT');
+  if (!last) {
+    el.innerText = 'No backup taken from this browser yet.';
+    el.className = 'text-[11px] font-bold text-amber-400 mt-1.5';
+    return;
+  }
+  const when = new Date(last);
+  const days = Math.floor((Date.now() - when.getTime()) / 86400000);
+  el.innerText = 'Last backup: ' + when.toLocaleString('en-IN') + (days > 0 ? '  (' + days + ' day(s) ago)' : '  (today)');
+  el.className = days >= 7
+    ? 'text-[11px] font-bold text-amber-400 mt-1.5'
+    : 'text-[11px] font-bold text-emerald-400 mt-1.5';
+}
+
+// Reads a backup file and reports what it contains, without changing anything.
+function handleBackupFileSelected(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function (ev) {
+    try {
+      const data = JSON.parse(ev.target.result);
+      if (!data || !Array.isArray(data.students)) throw new Error('Not a KCTC backup file.');
+      state.pendingRestore = data;
+
+      const info = document.getElementById('restore-preview');
+      if (info) {
+        info.classList.remove('hidden');
+        info.innerHTML =
+          '<div class="text-[11px] leading-relaxed">' +
+          '<strong class="text-[#c5a059]">' + file.name + '</strong><br>' +
+          'Taken: ' + new Date(data.exported_at).toLocaleString('en-IN') + '<br>' +
+          'From: <strong>' + (data.environment || 'unknown').toUpperCase() + '</strong> — ' + (data.supabase_url || 'n/a') + '<br><br>' +
+          'Students: <strong>' + data.students.length + '</strong> &nbsp; ' +
+          'Inquiries: <strong>' + (data.inquiries || []).length + '</strong><br>' +
+          'Certificates: <strong>' + (data.certificates || []).length + '</strong> &nbsp; ' +
+          'Courses: <strong>' + (data.courses || []).length + '</strong>' +
+          ((data.environment && data.environment !== ENV)
+            ? '<br><br><span class="text-amber-400">Warning: this backup came from the ' +
+              String(data.environment).toUpperCase() + ' database but you are connected to ' +
+              ENV.toUpperCase() + '.</span>'
+            : '') +
+          '</div>';
+      }
+    } catch (err) {
+      alert('Could not read that file: ' + err.message);
+      state.pendingRestore = null;
+    }
+  };
+  reader.readAsText(file);
+}
+
+// Restores a backup. Only ADDS records whose id is missing from the cloud.
+// Existing rows are left untouched, so this can never overwrite newer data.
+async function restoreFromBackup() {
+  const data = state.pendingRestore;
+  if (!data) { alert('Choose a backup file first.'); return; }
+
+  if (!state.supabaseClient) { alert('No database connection — cannot restore.'); return; }
+
+  if (!confirm('Restore missing records from this backup into the ' + ENV.toUpperCase() + ' database?\n\n' +
+               'Records that already exist will NOT be modified. Only rows missing from the database will be added.')) return;
+
+  // Safety snapshot of the CURRENT state before touching anything.
+  downloadFullBackup('before-restore');
+
+  const tables = [
+    { name: 'admin_students', rows: data.students || [], key: 'students' },
+    { name: 'inquiries', rows: data.inquiries || [], key: 'inquiries' },
+    { name: 'certificates', rows: data.certificates || [], key: 'certificates' },
+    { name: 'courses', rows: data.courses || [], key: 'courses' }
+  ];
+
+  const summary = [];
+  for (const t of tables) {
+    if (t.rows.length === 0) { summary.push(t.name + ': nothing in backup'); continue; }
+    try {
+      const { data: existing, error: readErr } = await state.supabaseClient.from(t.name).select('id');
+      if (readErr) { summary.push(t.name + ': READ FAILED — ' + readErr.message); continue; }
+
+      const have = new Set((existing || []).map(r => r.id));
+      const toAdd = t.rows.filter(r => r && r.id && !have.has(r.id));
+
+      if (toAdd.length === 0) { summary.push(t.name + ': already up to date'); continue; }
+
+      const { error: insErr } = await state.supabaseClient.from(t.name).insert(toAdd);
+      summary.push(insErr
+        ? t.name + ': FAILED — ' + insErr.message
+        : t.name + ': restored ' + toAdd.length + ' record(s)');
+    } catch (err) {
+      summary.push(t.name + ': ERROR — ' + (err.message || String(err)));
+    }
+  }
+
+  await syncWithRemoteDatabase();
+  renderStudentsTable();
+  renderInquiriesTable();
+  renderCertificatesLedger();
+  renderCoursesTable();
+  updateAnalyticsDashboard();
+
+  alert('Restore finished:\n\n' + summary.join('\n'));
 }
 
 function downloadCSV(filename, headers, rows) {
@@ -1754,11 +3615,11 @@ function downloadCSV(filename, headers, rows) {
 }
 
 function exportStudentsCSV() {
-  var headers = ['Roll Number', 'Full Name', 'Father Name', 'Phone', 'Email', 'Course', 'Fees Amount', 'Fees Paid', 'Due Date', 'Total Paid', 'Enrollment Status', 'Created At'];
-  var rows = state.students.map(function(s) {
+  var headers = ['S.No', 'Roll Number', 'Full Name', 'Father Name', 'Phone', 'Email', 'Course', 'Fees Amount', 'Fees Paid', 'Due Date', 'Total Paid', 'Enrollment Status', 'Created At'];
+  var rows = state.students.map(function(s, idx) {
     var totalPaid = (s.payments || []).reduce(function(sum, p) { return sum + (p.amount || 0); }, 0);
     return [
-      s.roll_number || '', s.full_name, s.father_name, s.phone, s.email,
+      idx + 1, s.roll_number || '', s.full_name, s.father_name, s.phone, s.email,
       s.enrolled_course, s.fees_amount, s.fees_paid ? 'Yes' : 'No',
       s.due_date || '', totalPaid, s.enrollment_status, s.created_at
     ];
@@ -1767,9 +3628,11 @@ function exportStudentsCSV() {
 }
 
 function exportCertificatesCSV() {
-  var headers = ['Student Name', 'Father Name', 'Roll Number', 'Course', 'Grade', 'Passing Year', 'Verification Code', 'Created At'];
+  var headers = ['Student Name', 'Father Name', 'Roll Number', 'Course', 'Grade', 'From (MM/YYYY)', 'To (MM/YYYY)', 'Passing Year', 'Verification Code', 'Created At'];
   var rows = state.certificates.map(function(c) {
-    return [c.student_name, c.father_name || '', c.roll_number, c.course_name, c.grade, c.passing_year, c.verification_code, c.created_at];
+    return [c.student_name, c.father_name || '', c.roll_number, c.course_name, c.grade,
+            formatMonthYear(c.from_month), formatMonthYear(c.to_month),
+            c.passing_year, c.verification_code, c.created_at];
   });
   downloadCSV('KCTC_Certificates_' + new Date().toISOString().split('T')[0] + '.csv', headers, rows);
 }
@@ -1836,7 +3699,7 @@ async function handleAdminAddStudentSubmit(e) {
 
   const newStd = {
     id: generateUUID(),
-    roll_number: generateRollNumber(),
+    roll_number: await reserveRollNumber(),
     full_name: name,
     father_name: father,
     dob: dob || null,
@@ -1859,6 +3722,7 @@ async function handleAdminAddStudentSubmit(e) {
   };
 
   state.students.push(newStd);
+  sortStudentsByRoll();
 
   // If this was converted from an inquiry, mark the inquiry as enrolled
   const convertInqId = document.getElementById('add-student-modal').getAttribute('data-convert-inq-id');
@@ -1981,32 +3845,44 @@ function renderCertificatesLedger() {
   if (!container) return;
   container.innerHTML = '';
 
-  const search = document.getElementById('cert-filter-search').value.trim().toLowerCase();
+  const searchEl = document.getElementById('cert-filter-search');
+  const search = searchEl ? searchEl.value.trim().toLowerCase() : '';
 
   const filtered = state.certificates.filter(c => {
     return c.student_name.toLowerCase().includes(search) || c.roll_number.toLowerCase().includes(search) || c.verification_code.toLowerCase().includes(search);
   });
+
+  const countLabel = document.getElementById('certificates-count-label');
+  if (countLabel) {
+    countLabel.innerText = filtered.length === state.certificates.length
+      ? 'Showing all ' + state.certificates.length + ' certificate(s)'
+      : 'Showing ' + filtered.length + ' of ' + state.certificates.length + ' certificate(s)';
+  }
+
+  // Set randomized code for next issues. This must run before the empty-state
+  // return, otherwise the very first certificate would have a blank code.
+  const codes = "KCTC-" + Math.floor(10000 + Math.random() * 90000).toString(16).toUpperCase();
+  const inputCode = document.getElementById('cert-verify-code');
+  if (inputCode && !inputCode.value) inputCode.value = codes;
 
   if (filtered.length === 0) {
     container.innerHTML = `<p class="p-8 text-center text-slate-500 font-bold text-xs">No issued designer certificates match criteria.</p>`;
     return;
   }
 
-  // Set randomized code for next issues
-  const codes = "KCTC-" + Math.floor(10000 + Math.random() * 90000).toString(16).toUpperCase();
-  const inputCode = document.getElementById('cert-verify-code');
-  if (inputCode) inputCode.value = codes;
-
-  filtered.forEach(c => {
+  filtered.forEach((c, idx) => {
     const card = document.createElement('div');
     card.className = "bg-slate-900 border border-slate-800 p-4 rounded-xl flex items-center justify-between";
     card.innerHTML = `
-      <div>
+      <div class="flex items-start gap-3">
+        <span class="inline-flex items-center justify-center w-6 h-6 rounded-lg bg-slate-950 border border-slate-800 text-[10px] font-black text-[#c5a059] shrink-0 mt-0.5">${idx + 1}</span>
+        <div>
         <h4 class="font-serif font-bold text-white text-sm">${c.student_name}</h4>
-        <p class="text-[10px] text-slate-500 mt-0.5 font-bold">Roll: ${c.roll_number} | Year: ${c.passing_year} | Grade: ${c.grade}</p>
+        <p class="text-[10px] text-slate-500 mt-0.5 font-bold">Roll: ${c.roll_number} | ${(c.from_month && c.to_month) ? formatMonthYear(c.from_month) + ' &ndash; ' + formatMonthYear(c.to_month) : 'Year: ' + c.passing_year} | Grade: ${c.grade}</p>
         <span class="text-[10px] text-[#c5a059] font-mono block mt-1">Verification PIN: ${c.verification_code}</span>
+        </div>
       </div>
-      <div class="flex gap-2">
+      <div class="flex gap-2 shrink-0">
         <button onclick="previewCertificateInline('${c.roll_number}')" class="p-1.5 bg-slate-950 text-slate-300 hover:text-white rounded-lg border border-slate-800 flex items-center gap-1.5 text-[10px] font-bold" title="Open digital credential">
           <i data-lucide="eye" class="w-3.5 h-3.5"></i>
           <span>Verify View</span>
@@ -2016,6 +3892,7 @@ function renderCertificatesLedger() {
         </button>
       </div>
     `;
+    card.style.animationDelay = (idx * 45) + 'ms';
     container.appendChild(card);
   });
   if (typeof lucide !== 'undefined') { lucide.createIcons(); }
@@ -2024,14 +3901,7 @@ function renderCertificatesLedger() {
 function previewCertificateInline(rollNumber) {
   const cert = state.certificates.find(c => c.roll_number === rollNumber);
   if (cert) {
-    document.getElementById('cert-view-name').innerText = cert.student_name;
-    document.getElementById('cert-view-father').innerText = cert.father_name;
-    document.getElementById('cert-view-course').innerText = cert.course_name;
-    document.getElementById('cert-view-roll').innerText = cert.roll_number;
-    document.getElementById('cert-view-grade').innerText = cert.grade;
-    document.getElementById('cert-view-year').innerText = cert.passing_year;
-    document.getElementById('cert-view-code').innerText = cert.verification_code;
-
+    populateCertificateViewer(cert);
     document.getElementById('certificate-viewer-modal').classList.remove('hidden');
   }
 }
@@ -2044,7 +3914,21 @@ async function handleIssueCertificate(e) {
   const code = document.getElementById('cert-verify-code').value.trim();
   const course = document.getElementById('cert-course-name').value;
   const grade = document.getElementById('cert-grade').value;
-  const year = parseInt(document.getElementById('cert-passing-year').value) || 2026;
+
+  const fromMonth = document.getElementById('cert-from-month').value;
+  const toMonth = document.getElementById('cert-to-month').value;
+
+  if (!fromMonth || !toMonth) {
+    alert('Please select both the "From" and "To" months for the course duration.');
+    return;
+  }
+  if (fromMonth > toMonth) {
+    alert('The "From" month cannot be later than the "To" month.');
+    return;
+  }
+
+  // Passing year is derived from the end of the course.
+  const year = parseInt(toMonth.split('-')[0], 10) || new Date().getFullYear();
 
   if (state.certificates.some(c => c.roll_number.toLowerCase() === roll.toLowerCase())) {
     alert("Roll number already has a certificate assigned!");
@@ -2058,6 +3942,8 @@ async function handleIssueCertificate(e) {
     roll_number: roll,
     course_name: course,
     passing_year: year,
+    from_month: fromMonth,
+    to_month: toMonth,
     grade: grade,
     verification_code: code,
     created_at: new Date().toISOString()
@@ -2079,7 +3965,8 @@ async function handleIssueCertificate(e) {
   document.getElementById('cert-student-name').value = '';
   document.getElementById('cert-father-name').value = '';
   document.getElementById('cert-roll-number').value = '';
-  document.getElementById('cert-passing-year').value = '2026';
+  document.getElementById('cert-from-month').value = '';
+  document.getElementById('cert-to-month').value = '';
 
   renderCertificatesLedger();
   alert(`Certificate issued successfully to ${name}! Verified under unique PIN "${code}". (UDYAM: ${UDYAM_NUMBER})`);
@@ -2102,19 +3989,30 @@ function renderCoursesTable() {
   if (!tbody) return;
   tbody.innerHTML = '';
 
-  const search = document.getElementById('courses-filter-search').value.trim().toLowerCase();
+  const searchEl = document.getElementById('courses-filter-search');
+  const search = searchEl ? searchEl.value.trim().toLowerCase() : '';
 
   const filtered = state.courses.filter(c => c.name.toLowerCase().includes(search) || c.description.toLowerCase().includes(search));
 
+  const countLabel = document.getElementById('courses-count-label');
+  if (countLabel) {
+    countLabel.innerText = filtered.length === state.courses.length
+      ? 'Showing all ' + state.courses.length + ' course(s)'
+      : 'Showing ' + filtered.length + ' of ' + state.courses.length + ' course(s)';
+  }
+
   if (filtered.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="6" class="p-8 text-center text-slate-500 font-bold">No courses found. Add one to get started.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="p-8 text-center text-slate-500 font-bold">No courses found. Add one to get started.</td></tr>`;
     return;
   }
 
-  filtered.forEach(c => {
+  filtered.forEach((c, idx) => {
     const tr = document.createElement('tr');
     tr.className = "border-b border-slate-800 hover:bg-slate-950/40 transition-all";
     tr.innerHTML = `
+      <td class="p-3.5 text-center align-top">
+        <span class="inline-flex items-center justify-center w-6 h-6 rounded-lg bg-slate-900 border border-slate-800 text-[10px] font-black text-[#c5a059]">${idx + 1}</span>
+      </td>
       <td class="p-3.5 text-2xl text-center">${c.icon || '📐'}</td>
       <td class="p-3.5"><strong class="text-white font-serif text-sm">${c.name}</strong></td>
       <td class="p-3.5 text-slate-400 font-semibold">${c.duration}</td>
@@ -2129,6 +4027,7 @@ function renderCoursesTable() {
         </button>
       </td>
     `;
+    tr.style.animationDelay = (idx * 35) + 'ms';
     tbody.appendChild(tr);
   });
   if (typeof lucide !== 'undefined') { lucide.createIcons(); }
@@ -2310,7 +4209,7 @@ async function saveSupabaseConfiguration() {
   populateCourseDropdowns();
   updateAnalyticsDashboard();
 
-  alert("Supabase active configuration saved! Live synchronized cloud database is running.");
+  renderDbToggle();
 }
 
 function resetSupabaseToDefaults() {
@@ -2324,7 +4223,110 @@ function resetSupabaseToDefaults() {
   document.getElementById('db-config-url').value = state.supabaseUrl;
   document.getElementById('db-config-key').value = state.supabaseKey;
   document.getElementById('db-test-result').classList.add('hidden');
-  alert("Reset to " + ENV.toUpperCase() + " defaults. Using: " + DEFAULT_SUPABASE_URL);
+  renderDbToggle();
+}
+
+// --- TOGGLE SWITCH UI ---
+function toggleAdvancedSettings() {
+  const panel = document.getElementById('db-advanced-settings');
+  const arrow = document.getElementById('db-adv-arrow');
+  if (!panel) return;
+  const isOpen = !panel.classList.contains('hidden');
+  if (isOpen) {
+    panel.classList.add('hidden');
+    if (arrow) arrow.style.transform = 'rotate(0deg)';
+  } else {
+    panel.classList.remove('hidden');
+    if (arrow) arrow.style.transform = 'rotate(180deg)';
+    document.getElementById('db-config-url').value = state.supabaseUrl || '';
+    document.getElementById('db-config-key').value = state.supabaseKey || '';
+  }
+}
+
+function renderDbToggle() {
+  const isActive = localStorage.getItem('KCTC_SUPABASE_ACTIVE') === '1';
+  const btn = document.getElementById('db-toggle-btn');
+  const dot = document.getElementById('db-toggle-dot');
+  const statusText = document.getElementById('db-toggle-status');
+  const badge = document.getElementById('db-status-badge');
+  const badgeIcon = document.getElementById('db-status-icon');
+  const badgeMsg = document.getElementById('db-status-msg');
+
+  if (!btn || !dot) return;
+
+  if (isActive) {
+    btn.className = 'relative w-14 h-7 rounded-full transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-[#c5a059]/50 bg-emerald-500';
+    dot.className = 'absolute top-0.5 left-7 w-6 h-6 rounded-full bg-white shadow-md transition-all duration-300';
+    if (statusText) statusText.innerText = 'Connected — live data syncing';
+    if (badge) { badge.className = 'flex items-center gap-2 p-3 rounded-xl border bg-emerald-500/10 border-emerald-500/30'; }
+    if (badgeIcon) { badgeIcon.className = 'w-2.5 h-2.5 rounded-full shrink-0 bg-emerald-500 animate-pulse'; }
+    if (badgeMsg) { badgeMsg.innerText = 'Cloud sync active'; badgeMsg.className = 'text-[11px] font-bold uppercase tracking-wider text-emerald-400'; }
+  } else {
+    btn.className = 'relative w-14 h-7 rounded-full transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-[#c5a059]/50 bg-slate-700';
+    dot.className = 'absolute top-0.5 left-0.5 w-6 h-6 rounded-full bg-white shadow-md transition-all duration-300';
+    if (statusText) statusText.innerText = 'Disconnected — offline mode';
+    if (badge) { badge.className = 'flex items-center gap-2 p-3 rounded-xl border bg-slate-500/10 border-slate-500/30'; }
+    if (badgeIcon) { badgeIcon.className = 'w-2.5 h-2.5 rounded-full shrink-0 bg-slate-500'; }
+    if (badgeMsg) { badgeMsg.innerText = 'Offline fallback active'; badgeMsg.className = 'text-[11px] font-bold uppercase tracking-wider text-slate-400'; }
+  }
+}
+
+async function toggleSupabaseConnection() {
+  const isActive = localStorage.getItem('KCTC_SUPABASE_ACTIVE') === '1';
+
+  if (isActive) {
+    // TURN OFF
+    localStorage.setItem('KCTC_SUPABASE_ACTIVE', '0');
+    state.supabaseClient = null;
+    updateDatabaseStatusIndicators();
+    renderDbToggle();
+    loadStateFromLocalStorage();
+    renderStudentsTable();
+    renderInquiriesTable();
+    renderCertificatesLedger();
+    renderCoursesTable();
+    updateAnalyticsDashboard();
+  } else {
+    // TURN ON
+    const url = state.supabaseUrl || localStorage.getItem('KCTC_SUPABASE_URL') || DEFAULT_SUPABASE_URL;
+    const key = state.supabaseKey || localStorage.getItem('KCTC_SUPABASE_KEY') || DEFAULT_SUPABASE_KEY;
+
+    if (!url || !key) {
+      alert('Supabase URL and Key are required. Open Advanced Settings to configure.');
+      return;
+    }
+
+    state.supabaseUrl = url;
+    state.supabaseKey = key;
+    localStorage.setItem('KCTC_SUPABASE_URL', url);
+    localStorage.setItem('KCTC_SUPABASE_KEY', key);
+    localStorage.setItem('KCTC_SUPABASE_ACTIVE', '1');
+
+    initSupabaseClient();
+    updateDatabaseStatusIndicators();
+
+    if (state.supabaseClient) {
+      const { error } = await state.supabaseClient.from('admin_students').select('id').limit(1);
+      if (error) {
+        localStorage.setItem('KCTC_SUPABASE_ACTIVE', '0');
+        state.supabaseClient = null;
+        updateDatabaseStatusIndicators();
+        renderDbToggle();
+        alert('Connection failed: ' + error.message);
+        return;
+      }
+
+      await syncWithRemoteDatabase();
+      renderStudentsTable();
+      renderInquiriesTable();
+      renderCertificatesLedger();
+      renderCoursesTable();
+      populateCourseDropdowns();
+      updateAnalyticsDashboard();
+    }
+
+    renderDbToggle();
+  }
 }
 
 function handleWipeAndResetAllData() {
@@ -2348,4 +4350,176 @@ function handleWipeAndResetAllData() {
     
     alert("Wiped successfully! App returned to initial offline fallback state.");
   }
+}
+
+// ============================================================================
+// STORAGE MIGRATION & ZIP DOWNLOAD
+// ============================================================================
+
+async function migrateStoragePaths() {
+  if (!state.supabaseClient) { alert('Supabase not configured.'); return; }
+
+  const docsToMigrate = [];
+  state.students.forEach(s => {
+    const docs = s.documents || {};
+    Object.keys(docs).forEach(type => {
+      if (type === 'selfDeclaration') return;
+      const d = docs[type];
+      if (!d || !d.path || !d.publicUrl) return;
+      if (d.path.includes('/')) return;
+      docsToMigrate.push({ student: s, docType: type, doc: d });
+    });
+  });
+
+  if (docsToMigrate.length === 0) {
+    alert('All documents are already using the new folder structure. Nothing to migrate.');
+    return;
+  }
+
+  if (!confirm('This will reorganize ' + docsToMigrate.length + ' document(s) into course/student folders.\n\nOld files will be deleted after migration.\n\nContinue?')) return;
+
+  let ok = 0, fail = 0;
+  const bucket = state.supabaseClient.storage.from('student-documents');
+
+  for (const item of docsToMigrate) {
+    try {
+      const { student, docType, doc } = item;
+      const ext = doc.name ? doc.name.split('.').pop() : (docType === 'passportPhoto' || docType === 'signature') ? 'jpg' : 'pdf';
+      const course = (student.enrolled_course || 'Unknown').replace(' Course', '');
+      const safeName = student.full_name.replace(/[^a-zA-Z0-9 ]/g, '').trim();
+      const roll = student.roll_number || 'NO-ROLL';
+      const newPath = course + '/' + safeName + ' (' + roll + ')/' + docType + '.' + ext;
+
+      const res = await fetch(doc.publicUrl);
+      if (!res.ok) throw new Error('Fetch failed: ' + res.status);
+      const blob = await res.blob();
+
+      await bucket.upload(newPath, blob, { upsert: true });
+
+      const pubRes = bucket.getPublicUrl(newPath);
+      student.documents[docType] = {
+        name: doc.name,
+        type: doc.type,
+        path: newPath,
+        publicUrl: pubRes.data.publicUrl,
+        uploadedAt: doc.uploadedAt
+      };
+
+      await bucket.remove([doc.path]);
+      ok++;
+    } catch (err) {
+      console.error('Migration failed for:', item.docType, err);
+      fail++;
+    }
+  }
+
+  saveStateToLocalStorage();
+  await syncWithRemoteDatabase();
+  renderStudentsTable();
+  alert('Migration complete!\n\nMigrated: ' + ok + '\nFailed: ' + fail);
+}
+
+function getStudentDocFolder(student) {
+  const course = (student.enrolled_course || 'Unknown').replace(' Course', '');
+  const safeName = student.full_name.replace(/[^a-zA-Z0-9 ]/g, '').trim();
+  const roll = student.roll_number || 'NO-ROLL';
+  return { course, folderName: safeName + ' (' + roll + ')' };
+}
+
+async function downloadDocsAsZip() {
+  const docs = collectStudentDocuments().filter(d => d.url);
+  if (docs.length === 0) { alert('No cloud-stored documents to download.'); return; }
+  if (!confirm('Download all ' + docs.length + ' document(s) as a ZIP file with folder structure?\n\nThis may take a few minutes.')) return;
+
+  const zip = new JSZip();
+  const folderMap = {};
+
+  state.students.forEach(s => {
+    const { course, folderName } = getStudentDocFolder(s);
+    const studentDocs = docs.filter(d => d.student === s.full_name);
+    if (studentDocs.length === 0) return;
+    if (!folderMap[s.id]) folderMap[s.id] = { course, folderName, docs: studentDocs };
+  });
+
+  const statusEl = document.getElementById('drive-status') || document.getElementById('db-status-text');
+  let count = 0;
+  const total = docs.length;
+
+  for (const key of Object.keys(folderMap)) {
+    const { course, folderName, docs: sDocs } = folderMap[key];
+    for (const d of sDocs) {
+      try {
+        const res = await fetch(d.url);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const blob = await res.blob();
+        const ext = d.name ? d.name.split('.').pop() : d.type.split('/').pop();
+        const fileName = d.type + '.' + ext;
+        zip.file(course + '/' + folderName + '/' + fileName, blob);
+        count++;
+        if (statusEl) statusEl.innerText = 'Zipping: ' + count + '/' + total;
+        await new Promise(r => setTimeout(r, 200));
+      } catch (err) {
+        console.error('ZIP fetch failed:', d.name, err);
+      }
+    }
+  }
+
+  const dateStr = new Date().toISOString().split('T')[0];
+  const content = await zip.generateAsync({ type: 'blob' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(content);
+  link.download = 'KCTC_Documents_' + dateStr + '.zip';
+  link.click();
+  URL.revokeObjectURL(link.href);
+  if (statusEl) statusEl.innerText = 'SUPABASE CONNECTED';
+  alert('ZIP downloaded with ' + count + ' document(s).');
+}
+
+async function downloadSelectedDocsAsZip() {
+  const ids = getSelectedStudentIds();
+  if (ids.length === 0) {
+    alert('No students selected. Use the checkboxes on the left to select students.');
+    return;
+  }
+
+  const selected = state.students.filter(s => ids.includes(s.id));
+  const docs = collectStudentDocuments().filter(d => d.url && selected.some(s => s.full_name === d.student));
+
+  if (docs.length === 0) {
+    alert('No cloud-stored documents found for selected students.');
+    return;
+  }
+
+  if (!confirm('Download ' + docs.length + ' document(s) from ' + selected.length + ' student(s) as ZIP?')) return;
+
+  const zip = new JSZip();
+  let count = 0;
+
+  for (const s of selected) {
+    const { course, folderName } = getStudentDocFolder(s);
+    const sDocs = docs.filter(d => d.student === s.full_name);
+    for (const d of sDocs) {
+      try {
+        const res = await fetch(d.url);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const blob = await res.blob();
+        const ext = d.name ? d.name.split('.').pop() : d.type.split('/').pop();
+        const fileName = d.type + '.' + ext;
+        zip.file(course + '/' + folderName + '/' + fileName, blob);
+        count++;
+        await new Promise(r => setTimeout(r, 200));
+      } catch (err) {
+        console.error('ZIP fetch failed:', d.name, err);
+      }
+    }
+  }
+
+  const dateStr = new Date().toISOString().split('T')[0];
+  const content = await zip.generateAsync({ type: 'blob' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(content);
+  link.download = 'KCTC_Selected_' + selected.length + 'Students_' + dateStr + '.zip';
+  link.click();
+  URL.revokeObjectURL(link.href);
+  alert('ZIP downloaded with ' + count + ' document(s) from ' + selected.length + ' student(s).');
 }
