@@ -129,33 +129,18 @@ function generateRollNumber() {
   return candidate;
 }
 
-// Allocates the next roll number, checking the live database first so
-// concurrent registrations from different devices don't reuse the same number.
+// Allocates the next roll number from the database atomically so concurrent
+// registrations from different devices never collide.
 async function reserveRollNumber() {
   if (state.supabaseClient) {
     try {
-      const { data, error: rollErr } = await state.supabaseClient
-        .from('admin_students')
-        .select('roll_number');
-      if (!rollErr && data) {
-        const known = new Set(state.students.map(s => String(s.roll_number || '').trim().toUpperCase()));
-        data.forEach(row => {
-          const roll = String(row.roll_number || '').trim().toUpperCase();
-          if (roll && !known.has(roll)) {
-            // Track remote-only rolls so the generator skips them.
-            state.students.push({ roll_number: roll, __rollPlaceholder: true });
-          }
-        });
-      }
+      const { data, error } = await state.supabaseClient.rpc('get_next_roll_number');
+      if (!error && data) return data;
     } catch (err) {
-      console.error('Could not read live roll numbers, falling back to local:', err);
+      console.error('get_next_roll_number RPC failed, falling back to local:', err);
     }
   }
-
-  const roll = generateRollNumber();
-  // Drop the temporary placeholders used only for collision checking.
-  state.students = state.students.filter(s => !s.__rollPlaceholder);
-  return roll;
+  return generateRollNumber();
 }
 
 function sortStudentsByRoll() {
@@ -352,17 +337,23 @@ window.addEventListener('DOMContentLoaded', async () => {
           .eq('auth_id', session.user.id)
           .single();
         if (student) {
-          state.currentSession = {
-            id: student.id,
-            auth_id: session.user.id,
-            email: student.email,
-            full_name: student.full_name,
-            father_name: student.father_name,
-            dob: student.dob,
-            phone: student.phone,
-            enrolled_course: student.enrolled_course
-          };
-          saveStateToLocalStorage();
+          if (student.is_deleted || student.deleted_at) {
+            // Soft-deleted student — clear session
+            state.currentSession = null;
+            localStorage.removeItem('KCTC_STUDENT_SESSION');
+          } else {
+            state.currentSession = {
+              id: student.id,
+              auth_id: session.user.id,
+              email: student.email,
+              full_name: student.full_name,
+              father_name: student.father_name,
+              dob: student.dob,
+              phone: student.phone,
+              enrolled_course: student.enrolled_course
+            };
+            saveStateToLocalStorage();
+          }
         }
       } else {
         // Admin user on admin page — restore admin session so sync has auth
@@ -1455,6 +1446,13 @@ async function handleStudentLogin(e) {
         student = studentRetry;
       }
 
+      if (student.is_deleted || student.deleted_at) {
+        errMsg.innerText = 'Your account has been deactivated. Please contact the administrator.';
+        errMsg.classList.remove('hidden');
+        await state.supabaseClient.auth.signOut();
+        return;
+      }
+
       state.currentSession = {
         id: student.id,
         auth_id: data.user.id,
@@ -1581,6 +1579,9 @@ async function handleStudentRegister(e) {
     if (insertErr) {
       // Rollback auth user
       await state.supabaseClient.auth.admin.deleteUser(authData.user.id);
+      // Clean up any partial student data from localStorage so user can re-register
+      state.students = state.students.filter(s => s.email !== email);
+      saveStateToLocalStorage();
       errMsg.innerText = "Failed to create student profile: " + insertErr.message;
       errMsg.classList.remove('hidden');
       return;
@@ -2521,8 +2522,12 @@ function renderStudentsTable() {
   const search = searchEl ? searchEl.value.trim().toLowerCase() : '';
   const filterCourse = document.getElementById('student-filter-course').value;
   const filterStatus = document.getElementById('student-filter-status').value;
+  const filterDeleted = document.getElementById('student-filter-deleted') ? document.getElementById('student-filter-deleted').value : 'active';
 
   const filtered = state.students.filter(s => {
+    const isDeleted = s.is_deleted === true || (s.deleted_at && s.deleted_at !== '');
+    if (filterDeleted === 'active' && isDeleted) return false;
+    if (filterDeleted === 'deleted' && !isDeleted) return false;
     const matchSearch = s.full_name.toLowerCase().includes(search) || s.phone.includes(search) || s.email.toLowerCase().includes(search);
     const matchCourse = filterCourse ? s.enrolled_course === filterCourse : true;
     const matchStatus = filterStatus ? s.enrollment_status === filterStatus : true;
@@ -2537,12 +2542,26 @@ function renderStudentsTable() {
       : 'Showing ' + filtered.length + ' of ' + state.students.length + ' student(s)';
   }
 
+  // Update deleted filter badge
+  const deletedFilterEl = document.getElementById('student-filter-deleted');
+  if (deletedFilterEl) {
+    const deletedCount = state.students.filter(s => s.is_deleted === true || (s.deleted_at && s.deleted_at !== '')).length;
+    const deletedOpt = deletedFilterEl.querySelector('option[value="deleted"]');
+    if (deletedOpt) deletedOpt.textContent = deletedCount > 0 ? `Deleted (${deletedCount})` : 'Deleted';
+  }
+
   if (filtered.length === 0) {
     tbody.innerHTML = `<tr><td colspan="8" class="p-8 text-center text-slate-500 font-bold">No registered students found matching filter parameters.</td></tr>`;
     return;
   }
 
   filtered.forEach((s, idx) => {
+    const isDeleted = s.is_deleted === true || (s.deleted_at && s.deleted_at !== '');
+    const deletedRowClass = isDeleted ? 'opacity-50 bg-red-950/20' : '';
+    const deletedNameClass = isDeleted ? 'line-through text-slate-500' : 'text-white';
+    const deletedBadge = isDeleted ? '<span class="ml-2 px-1.5 py-0.5 bg-red-500/20 text-red-400 rounded text-[8px] font-bold">DELETED</span>' : '';
+    const deletedAtStr = isDeleted && s.deleted_at ? new Date(s.deleted_at).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+
     const statusClass = s.enrollment_status === 'accepted' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 
                         s.enrollment_status === 'declined' ? 'bg-red-500/10 text-red-400 border border-red-500/20' : 
                         'bg-amber-500/10 text-amber-400 border border-amber-500/20';
@@ -2555,7 +2574,7 @@ function renderStudentsTable() {
     const docCount = s.documents ? Object.keys(s.documents).filter(k => k !== 'selfDeclaration' && s.documents[k] && (s.documents[k].dataUrl || s.documents[k].publicUrl)).length : 0;
 
     const tr = document.createElement('tr');
-    tr.className = "border-b border-slate-800 hover:bg-slate-950/40 transition-all";
+    tr.className = `border-b border-slate-800 hover:bg-slate-950/40 transition-all ${deletedRowClass}`;
     tr.innerHTML = `
       <td class="p-3.5 text-center align-top">
         <input type="checkbox" data-student-id="${s.id}" class="student-checkbox w-3.5 h-3.5 accent-[#c5a059] cursor-pointer">
@@ -2564,9 +2583,10 @@ function renderStudentsTable() {
         <span class="inline-flex items-center justify-center w-6 h-6 rounded-lg bg-slate-900 border border-slate-800 text-[10px] font-black text-[#c5a059]">${idx + 1}</span>
       </td>
       <td class="p-3.5">
-        <strong class="block text-white font-serif text-sm">${s.full_name}</strong>
+        <strong class="block font-serif text-sm ${deletedNameClass}">${s.full_name}${deletedBadge}</strong>
         <span class="text-[10px] text-slate-500 font-bold uppercase mt-1 block">${s.roll_number || '—'}</span>
         <span class="text-[9px] text-slate-600 block">Father: ${s.father_name}</span>
+        ${isDeleted && deletedAtStr ? `<span class="text-[9px] text-red-400 block mt-0.5">Deleted: ${deletedAtStr}</span>` : ''}
       </td>
       <td class="p-3.5">
         <span class="block font-medium text-slate-300">${s.phone}</span>
@@ -2613,12 +2633,21 @@ function renderStudentsTable() {
         </div>
       </td>
       <td class="p-3.5 text-right flex justify-end gap-2 mt-2.5">
-        <button onclick="openEditStudentModal('${s.id}')" class="p-1.5 bg-slate-900 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-all border border-slate-800" title="Edit candidate">
-          <i data-lucide="edit-3" class="w-4 h-4"></i>
-        </button>
-        <button onclick="handleAdminDeleteStudent('${s.id}')" class="p-1.5 bg-slate-900 hover:bg-red-950 rounded-lg text-slate-500 hover:text-red-400 transition-all border border-slate-800 hover:border-red-900" title="Delete record">
-          <i data-lucide="trash-2" class="w-4 h-4"></i>
-        </button>
+        ${isDeleted ? `
+          <button onclick="handleAdminRestoreStudent('${s.id}')" class="p-1.5 bg-slate-900 hover:bg-emerald-950 rounded-lg text-slate-400 hover:text-emerald-400 transition-all border border-slate-800 hover:border-emerald-800" title="Restore student">
+            <i data-lucide="undo-2" class="w-4 h-4"></i>
+          </button>
+          <button onclick="handleAdminHardDeleteStudent('${s.id}')" class="p-1.5 bg-slate-900 hover:bg-red-950 rounded-lg text-slate-500 hover:text-red-400 transition-all border border-slate-800 hover:border-red-900" title="Permanently delete (frees roll number)">
+            <i data-lucide="trash-2" class="w-4 h-4"></i>
+          </button>
+        ` : `
+          <button onclick="openEditStudentModal('${s.id}')" class="p-1.5 bg-slate-900 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-all border border-slate-800" title="Edit candidate">
+            <i data-lucide="edit-3" class="w-4 h-4"></i>
+          </button>
+          <button onclick="handleAdminDeleteStudent('${s.id}')" class="p-1.5 bg-slate-900 hover:bg-red-950 rounded-lg text-slate-500 hover:text-red-400 transition-all border border-slate-800 hover:border-red-900" title="Soft delete (roll number preserved)">
+            <i data-lucide="trash-2" class="w-4 h-4"></i>
+          </button>
+        `}
       </td>
     `;
     tr.style.animationDelay = (idx * 35) + 'ms';
@@ -3666,7 +3695,6 @@ function openAddStudentModal() {
   document.getElementById('add-student-residence').value = '';
   document.getElementById('add-student-phone').value = '';
   document.getElementById('add-student-email').value = '';
-  document.getElementById('add-student-password').value = '';
   document.getElementById('add-student-fees').value = 4500;
   document.getElementById('add-student-paid').checked = false;
   document.getElementById('add-student-status').value = 'accepted';
@@ -3687,7 +3715,6 @@ async function handleAdminAddStudentSubmit(e) {
   const residence = document.getElementById('add-student-residence').value.trim();
   const phone = document.getElementById('add-student-phone').value.trim();
   const email = document.getElementById('add-student-email').value.trim().toLowerCase();
-  const password = document.getElementById('add-student-password').value.trim() || 'password123';
   const fees = parseInt(document.getElementById('add-student-fees').value) || 4500;
   const status = document.getElementById('add-student-status').value;
   const paid = document.getElementById('add-student-paid').checked;
@@ -3708,7 +3735,6 @@ async function handleAdminAddStudentSubmit(e) {
     residence: residence,
     phone: phone,
     email: email,
-    password: password,
     enrolled_course: document.getElementById('add-student-course').value,
     fees_paid: paid,
     fees_amount: fees,
@@ -3769,7 +3795,6 @@ function openEditStudentModal(id) {
   document.getElementById('edit-student-residence').value = s.residence;
   document.getElementById('edit-student-phone').value = s.phone;
   document.getElementById('edit-student-email').value = s.email;
-  document.getElementById('edit-student-password').value = s.password || 'password123';
   document.getElementById('edit-student-course').value = s.enrolled_course;
   document.getElementById('edit-student-fees').value = s.fees_amount;
   document.getElementById('edit-student-status').value = s.enrollment_status || 'accepted';
@@ -3800,7 +3825,6 @@ async function handleAdminEditStudentSubmit(e) {
     residence: document.getElementById('edit-student-residence').value.trim(),
     phone: document.getElementById('edit-student-phone').value.trim(),
     email: document.getElementById('edit-student-email').value.trim().toLowerCase(),
-    password: document.getElementById('edit-student-password').value.trim() || 'password123',
     enrolled_course: document.getElementById('edit-student-course').value,
     fees_paid: document.getElementById('edit-student-paid').checked,
     fees_amount: parseInt(document.getElementById('edit-student-fees').value) || 4500,
@@ -3828,15 +3852,73 @@ async function handleAdminEditStudentSubmit(e) {
 }
 
 async function handleAdminDeleteStudent(id) {
-  if (confirm("Are you sure you want to permanently delete this student enrollment from academy registry?")) {
-    state.students = state.students.filter(s => s.id !== id);
-    saveStateToLocalStorage();
-    if (state.supabaseClient) {
-      const { error: deleteErr } = await state.supabaseClient.from('admin_students').delete().eq('id', id);
-      if (deleteErr) console.error('Failed to delete from remote:', deleteErr);
+  const student = state.students.find(s => s.id === id);
+  if (!student) return;
+  if (!confirm(`Soft delete "${student.full_name}"? Their roll number ${student.roll_number || '(none)'} will remain reserved. You can restore from the Deleted filter.`)) return;
+
+  const now = new Date().toISOString();
+  student.is_deleted = true;
+  student.deleted_at = now;
+  saveStateToLocalStorage();
+
+  if (state.supabaseClient) {
+    const { error } = await state.supabaseClient
+      .from('admin_students')
+      .update({ is_deleted: true, deleted_at: now })
+      .eq('id', id);
+    if (error) {
+      console.error('Soft delete failed:', error);
+      alert('Failed to delete student: ' + error.message);
+      return;
     }
-    renderStudentsTable();
   }
+  const deletedFilter = document.getElementById('student-filter-deleted');
+  if (deletedFilter) deletedFilter.value = 'deleted';
+  renderStudentsTable();
+}
+
+async function handleAdminRestoreStudent(id) {
+  const student = state.students.find(s => s.id === id);
+  if (!student) return;
+  if (!confirm(`Restore "${student.full_name}" (Roll: ${student.roll_number || 'none'})?`)) return;
+
+  student.is_deleted = false;
+  student.deleted_at = null;
+  saveStateToLocalStorage();
+
+  if (state.supabaseClient) {
+    const { error } = await state.supabaseClient
+      .from('admin_students')
+      .update({ is_deleted: false, deleted_at: null })
+      .eq('id', id);
+    if (error) {
+      console.error('Restore failed:', error);
+      alert('Failed to restore student: ' + error.message);
+      return;
+    }
+  }
+  const deletedFilter = document.getElementById('student-filter-deleted');
+  if (deletedFilter) deletedFilter.value = 'active';
+  renderStudentsTable();
+}
+
+async function handleAdminHardDeleteStudent(id) {
+  const student = state.students.find(s => s.id === id);
+  if (!student) return;
+  if (!confirm(`PERMANENTLY DELETE "${student.full_name}" (Roll: ${student.roll_number || 'none'})?\n\nThis cannot be undone. The roll number will become available for reuse.`)) return;
+
+  state.students = state.students.filter(s => s.id !== id);
+  saveStateToLocalStorage();
+
+  if (state.supabaseClient) {
+    const { error } = await state.supabaseClient.from('admin_students').delete().eq('id', id);
+    if (error) {
+      console.error('Hard delete failed:', error);
+      alert('Failed to permanently delete: ' + error.message);
+      return;
+    }
+  }
+  renderStudentsTable();
 }
 
 // --- CERTIFICATIONS ISSUE ENGINE ---

@@ -264,6 +264,11 @@
                 <option value="pending">Pending</option>
                 <option value="declined">Declined</option>
               </select>
+              <select id="student-filter-deleted" onchange="renderStudentsTable()" class="bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs font-semibold text-slate-300 outline-none">
+                <option value="active">Active</option>
+                <option value="deleted">Deleted</option>
+                <option value="all">All</option>
+              </select>
             </div>
           </div>
 
@@ -902,11 +907,6 @@
         </div>
 
         <div>
-          <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Portal Password</label>
-          <input type="text" id="add-student-password" class="w-full px-4 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-[#c5a059] font-mono outline-none focus:border-[#c5a059]" placeholder="password123">
-        </div>
-
-        <div>
           <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Academy Vocational Course *</label>
           <select id="add-student-course" class="w-full px-4 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-200 outline-none focus:border-[#c5a059]" required>
             <option value="Boutique Tailoring & Stitching Course">Boutique Tailoring &amp; Stitching Course (3 Mos)</option>
@@ -1010,11 +1010,6 @@
             <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Email Address *</label>
             <input type="email" id="edit-student-email" class="w-full px-4 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-[#c5a059]" required>
           </div>
-        </div>
-
-        <div>
-          <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Portal Password</label>
-          <input type="text" id="edit-student-password" class="w-full px-4 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-[#c5a059] font-mono outline-none focus:border-[#c5a059]">
         </div>
 
         <div>
