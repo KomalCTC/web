@@ -20,6 +20,21 @@ const SUPABASE_CONFIG = {
 function detectEnvironment() {
   var host = window.location.hostname;
   if (!host || host === 'localhost' || host === '127.0.0.1' || host === '') return 'dev';
+
+  // Private LAN addresses (file://, localhost, or testing from a phone on the
+  // same Wi-Fi) also map to DEV so trial runs never touch production data.
+  // Real hostnames and public IPs still resolve to production.
+  var isPrivateHost =
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    /^192\.168\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    /^f[cd][0-9a-f]{2}:/i.test(host) ||
+    /^fe8[0-9a-f]:/i.test(host) ||
+    host === '::1' ||
+    /\.local$/i.test(host);
+  if (isPrivateHost) return 'dev';
+
   return 'production';
 }
 
@@ -1743,41 +1758,46 @@ const DOC_LABELS = {
 
 // ----------------------------------------------------------------------------
 // UPLOAD RULES
-// Documents are PDF-only and capped at 200 KB so the whole document set stays
-// small enough to back up to Google Drive comfortably.
-// Image types are the exception: a passport photo / signature cannot sensibly
-// be a PDF, so those stay as images (still capped).
+// Every document slot (Aadhar, 10th DMC, 12th DMC, Graduation, Passport Photo,
+// Signature) takes a JPG/JPEG or PNG image, capped at 200 KB so the whole
+// document set stays small enough to back up to Google Drive comfortably.
 //
-// To make the signature PDF-only too, just remove it from IMAGE_DOC_TYPES.
+// PDFs are no longer accepted: the student converts the document to a JPG
+// photo/scan themselves before uploading. The file picker's accept attribute
+// in index.html mirrors this rule, but validateDocFile() below is the real
+// gate — the picker can always be bypassed.
 // ----------------------------------------------------------------------------
 const DOC_MAX_BYTES = 200 * 1024;          // 200 KB
-const IMAGE_DOC_TYPES = ['passportPhoto', 'signature'];
-
-function isImageDoc(docType) {
-  return IMAGE_DOC_TYPES.indexOf(docType) !== -1;
-}
 
 function formatBytes(bytes) {
   if (bytes < 1024) return bytes + ' B';
   return (bytes / 1024).toFixed(0) + ' KB';
 }
 
-// Returns null when the file is acceptable, otherwise an error message.
-function validateDocFile(docType, file) {
-  const imageAllowed = isImageDoc(docType);
+// Format-only check: returns null when the file type is acceptable, otherwise
+// an error message. Split from validateDocFile() so an oversized image can be
+// re-encoded by compressImageFile() BEFORE the size cap is enforced.
+function validateDocFileType(docType, file) {
   const name = (file.name || '').toLowerCase();
 
-  if (imageAllowed) {
-    const okType = /^image\/(jpeg|jpg|png)$/.test(file.type) || /\.(jpe?g|png)$/.test(name);
-    if (!okType) {
-      return DOC_LABELS[docType] + ' must be a JPG or PNG image.';
+  const okType = /^image\/(jpeg|jpg|png)$/.test(file.type) || /\.(jpe?g|png)$/.test(name);
+  if (!okType) {
+    if (/^application\/pdf$/.test(file.type) || /\.pdf$/.test(name)) {
+      return DOC_LABELS[docType] + ' must be a JPG image, not a PDF. ' +
+             'Open your PDF, save or print its page as a JPG (or simply take a ' +
+             'photo of the document), then upload that image.';
     }
-  } else {
-    const okType = file.type === 'application/pdf' || /\.pdf$/.test(name);
-    if (!okType) {
-      return DOC_LABELS[docType] + ' must be a PDF file. Please convert your document to PDF and try again.';
-    }
+    return DOC_LABELS[docType] + ' must be a JPG or PNG image.';
   }
+
+  return null;
+}
+
+// Full gate: format + size + empty. Run this on the FINAL file (after
+// compression) so nothing oversized ever reaches storage.
+function validateDocFile(docType, file) {
+  const typeError = validateDocFileType(docType, file);
+  if (typeError) return typeError;
 
   if (file.size > DOC_MAX_BYTES) {
     return 'File is ' + formatBytes(file.size) + '. Maximum allowed is ' +
@@ -1789,6 +1809,49 @@ function validateDocFile(docType, file) {
   }
 
   return null;
+}
+
+// Re-encodes an oversized image on a canvas at falling quality / resolution
+// until it fits under DOC_MAX_BYTES, so students never have to compress the
+// photo themselves. Resolves with a new File (.jpg / image/jpeg); if every
+// attempt is still too large it resolves with the ORIGINAL file unchanged and
+// validateDocFile() rejects it with the usual size message.
+function compressImageFile(file) {
+  if (file.size <= DOC_MAX_BYTES) return Promise.resolve(file);
+
+  const STEPS = [
+    { q: 0.85, max: 2400 }, { q: 0.7, max: 2400 }, { q: 0.55, max: 2400 },
+    { q: 0.7,  max: 1600 }, { q: 0.5, max: 1600 }, { q: 0.4, max: 1200 }
+  ];
+
+  return new Promise(function(resolve) {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+
+    img.onload = function() {
+      const step = function(i) {
+        if (i >= STEPS.length) { URL.revokeObjectURL(url); resolve(file); return; }
+        const scale = Math.min(1, STEPS[i].max / Math.max(img.width, img.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(function(blob) {
+          if (blob && blob.size <= DOC_MAX_BYTES) {
+            URL.revokeObjectURL(url);
+            const outName = (file.name || 'document.jpg').replace(/\.[^.]+$/, '.jpg');
+            resolve(new File([blob], outName, { type: 'image/jpeg', lastModified: Date.now() }));
+          } else {
+            step(i + 1);
+          }
+        }, 'image/jpeg', STEPS[i].q);
+      };
+      step(0);
+    };
+
+    img.onerror = function() { URL.revokeObjectURL(url); resolve(file); };
+    img.src = url;
+  });
 }
 
 function getCurrentStudent() {
@@ -1803,79 +1866,113 @@ async function syncStudentToSupabase(student) {
 }
 
 function uploadTypedDoc(docType, input) {
-  const file = input.files[0];
-  if (!file) return;
+  const pickedFile = input.files[0];
+  if (!pickedFile) return;
   const msg = document.getElementById('portal-doc-msg');
 
-  const validationError = validateDocFile(docType, file);
-  if (validationError) {
+  const showValidationError = function(text) {
     msg.className = 'text-xs font-bold mt-1 text-red-600';
-    msg.innerText = validationError;
+    msg.innerText = text;
     msg.classList.remove('hidden');
     input.value = '';
     setTimeout(() => msg.classList.add('hidden'), 6000);
+  };
+
+  // 1) Refuse PDFs and other wrong formats before doing any work.
+  const typeError = validateDocFileType(docType, pickedFile);
+  if (typeError) {
+    showValidationError(typeError);
     return;
   }
 
-  const student = getCurrentStudent();
-  if (!student) return;
-  if (!student.documents) student.documents = {};
-
-  const doUpload = function(dataUrl) {
-    student.documents[docType] = {
-      name: file.name,
-      type: file.type,
-      dataUrl: dataUrl,
-      uploadedAt: new Date().toISOString()
-    };
-    saveStateToLocalStorage();
-    syncStudentToSupabase(student);
-    msg.className = 'text-xs font-bold mt-1 text-emerald-600';
-    msg.innerText = DOC_LABELS[docType] + ' uploaded successfully!';
+  // 2) Anything over the cap is re-encoded on a canvas first, so the student
+  //    never runs into a "please compress it" wall.
+  const needsCompress = pickedFile.size > DOC_MAX_BYTES;
+  if (needsCompress) {
+    msg.className = 'text-xs font-bold mt-1 text-amber-600';
+    msg.innerText = 'Compressing ' + DOC_LABELS[docType] + ' to under ' + formatBytes(DOC_MAX_BYTES) + '...';
     msg.classList.remove('hidden');
-    renderTypedDocs(student);
-    input.value = '';
-    setTimeout(() => msg.classList.add('hidden'), 3000);
-  };
-
-  // Try Supabase Storage first
-  if (state.supabaseClient) {
-    const ext = file.name.split('.').pop();
-    const course = (student.enrolled_course || 'Unknown').replace(' Course', '');
-    const safeName = student.full_name.replace(/[^a-zA-Z0-9 ]/g, '').trim();
-    const roll = student.roll_number || 'NO-ROLL';
-    const filePath = course + '/' + safeName + ' (' + roll + ')/' + docType + '.' + ext;
-    state.supabaseClient.storage.from('student-documents').upload(filePath, file, { upsert: true }).then(function(result) {
-      if (!result.error) {
-        var pubRes = state.supabaseClient.storage.from('student-documents').getPublicUrl(filePath);
-        student.documents[docType] = {
-          name: file.name,
-          type: file.type,
-          path: filePath,
-          publicUrl: pubRes.data.publicUrl,
-          uploadedAt: new Date().toISOString()
-        };
-        saveStateToLocalStorage();
-        syncStudentToSupabase(student);
-        msg.className = 'text-xs font-bold mt-1 text-emerald-600';
-        msg.innerText = DOC_LABELS[docType] + ' uploaded to cloud!';
-        msg.classList.remove('hidden');
-        renderTypedDocs(student);
-        input.value = '';
-        setTimeout(function() { msg.classList.add('hidden'); }, 3000);
-      } else {
-        // Fallback to base64
-        var fallbackReader = new FileReader();
-        fallbackReader.onload = function(ev2) { doUpload(ev2.target.result); };
-        fallbackReader.readAsDataURL(file);
-      }
-    });
-  } else {
-    // No Supabase — use base64
-    var reader = new FileReader();
-    reader.onload = function(ev) { doUpload(ev.target.result); };
-    reader.readAsDataURL(file);
   }
+
+  Promise.resolve(needsCompress ? compressImageFile(pickedFile) : pickedFile).then(function(file) {
+    // 3) Final gate — runs on the (possibly re-encoded) file.
+    const finalError = validateDocFile(docType, file);
+    if (finalError) {
+      showValidationError(needsCompress && file === pickedFile
+        ? DOC_LABELS[docType] + ' could not be reduced under ' + formatBytes(DOC_MAX_BYTES) +
+          '. Please take a lower-resolution photo and try again.'
+        : finalError);
+      return;
+    }
+
+    const student = getCurrentStudent();
+    if (!student) return;
+    if (!student.documents) student.documents = {};
+
+    // Some mobile file pickers report an empty MIME type. Validation above has
+    // already proven the file ends in .jpg/.jpeg/.png, so derive the type from
+    // the extension — otherwise previewTypedDoc()/adminOpenDoc() would fall back
+    // to the PDF <embed> branch and show a broken page.
+    const fileType = file.type || (/\.png$/i.test(file.name) ? 'image/png' : 'image/jpeg');
+
+    const doUpload = function(dataUrl) {
+      student.documents[docType] = {
+        name: file.name,
+        type: fileType,
+        dataUrl: dataUrl,
+        uploadedAt: new Date().toISOString()
+      };
+      saveStateToLocalStorage();
+      syncStudentToSupabase(student);
+      msg.className = 'text-xs font-bold mt-1 text-emerald-600';
+      msg.innerText = DOC_LABELS[docType] + (needsCompress ? ' compressed & uploaded successfully!' : ' uploaded successfully!');
+      msg.classList.remove('hidden');
+      renderTypedDocs(student);
+      input.value = '';
+      setTimeout(() => msg.classList.add('hidden'), 3000);
+    };
+
+    // Try Supabase Storage first
+    if (state.supabaseClient) {
+      const ext = (file.name.split('.').pop() || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase() || 'jpg';
+      const course = (student.enrolled_course || 'Unknown').replace(' Course', '');
+      const safeName = student.full_name.replace(/[^a-zA-Z0-9 ]/g, '').trim();
+      const roll = student.roll_number || 'NO-ROLL';
+      const filePath = course + '/' + safeName + ' (' + roll + ')/' + docType + '.' + ext;
+      state.supabaseClient.storage.from('student-documents').upload(filePath, file, { upsert: true }).then(function(result) {
+        if (!result.error) {
+          var pubRes = state.supabaseClient.storage.from('student-documents').getPublicUrl(filePath);
+          student.documents[docType] = {
+            name: file.name,
+            type: fileType,
+            path: filePath,
+            publicUrl: pubRes.data.publicUrl,
+            uploadedAt: new Date().toISOString()
+          };
+          saveStateToLocalStorage();
+          syncStudentToSupabase(student);
+          msg.className = 'text-xs font-bold mt-1 text-emerald-600';
+          msg.innerText = DOC_LABELS[docType] + (needsCompress ? ' compressed & uploaded to cloud!' : ' uploaded to cloud!');
+          msg.classList.remove('hidden');
+          renderTypedDocs(student);
+          input.value = '';
+          setTimeout(function() { msg.classList.add('hidden'); }, 3000);
+        } else {
+          // Fallback to base64
+          var fallbackReader = new FileReader();
+          fallbackReader.onload = function(ev2) { doUpload(ev2.target.result); };
+          fallbackReader.readAsDataURL(file);
+        }
+      });
+    } else {
+      // No Supabase — use base64
+      var reader = new FileReader();
+      reader.onload = function(ev) { doUpload(ev.target.result); };
+      reader.readAsDataURL(file);
+    }
+  }).catch(function(err) {
+    showValidationError('Upload failed: ' + (err && err.message ? err.message : err));
+  });
 }
 
 function renderTypedDocs(student) {
@@ -2396,6 +2493,10 @@ function setAdminTab(tabId) {
   });
 
   state.activeAdminTab = tabId;
+
+  // Below lg the sidebar is a slide-in drawer — close it as soon as a tab is
+  // chosen, otherwise it covers the section the user just opened.
+  if (window.innerWidth < 1024) toggleAdminSidebar(false);
 
   if (tabId === 'analytics') {
     updateAnalyticsDashboard();
@@ -4466,7 +4567,7 @@ async function migrateStoragePaths() {
   for (const item of docsToMigrate) {
     try {
       const { student, docType, doc } = item;
-      const ext = doc.name ? doc.name.split('.').pop() : (docType === 'passportPhoto' || docType === 'signature') ? 'jpg' : 'pdf';
+      const ext = doc.name ? doc.name.split('.').pop() : (doc.type === 'application/pdf') ? 'pdf' : 'jpg';
       const course = (student.enrolled_course || 'Unknown').replace(' Course', '');
       const safeName = student.full_name.replace(/[^a-zA-Z0-9 ]/g, '').trim();
       const roll = student.roll_number || 'NO-ROLL';

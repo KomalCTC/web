@@ -809,9 +809,9 @@
           <div class="mt-2 flex items-start gap-2 bg-[#c5a059]/10 border border-[#c5a059]/30 rounded-xl p-2.5">
             <i data-lucide="info" class="w-3.5 h-3.5 text-[#c5a059] shrink-0 mt-0.5"></i>
             <p class="text-[10px] text-[#501537] leading-relaxed">
-              <strong>Documents must be PDF files, maximum 200 KB each.</strong>
-              Passport photo and signature may be JPG or PNG (also max 200 KB).
-              Need to compress your PDF? Use this free tool: <a href="https://bigpdf.11zon.com/en/compress-pdf/compress-pdf-to-200kb.php" target="_blank" rel="noopener" class="underline font-bold text-[#c5a059] hover:text-[#501537]">Compress PDF to 200KB</a>
+              <strong>Documents must be JPG or PNG images, maximum 200 KB each.</strong>
+              PDF files are no longer accepted: Aadhar card, 10th DMC and 12th DMC must be uploaded as a JPG photo or scan.
+              If you only have a PDF, open it and save or print the page as a JPG &mdash; or simply take a photo of the document with your phone camera.
             </p>
           </div>
           
@@ -822,11 +822,11 @@
                 <span class="text-red-500">*</span> Aadhar Card
               </label>
               <div id="doc-status-aadhar" class="text-[10px] text-slate-400 italic">Not uploaded</div>
-              <span class="text-[9px] text-gray-400 font-semibold">PDF only &middot; max 200 KB</span>
+              <span class="text-[9px] text-gray-400 font-semibold">JPG/PNG &middot; max 200 KB</span>
               <div class="flex gap-1.5 mt-1">
                 <label class="px-2.5 py-1.5 bg-[#501537] hover:bg-[#c5a059] text-white text-[9px] font-bold uppercase rounded-lg cursor-pointer transition-all">
                   Choose File
-                  <input type="file" accept="application/pdf,.pdf" class="hidden" onchange="uploadTypedDoc('aadhar', this)">
+                  <input type="file" accept="image/jpeg,image/jpg,image/png,.jpg,.jpeg,.png" class="hidden" onchange="uploadTypedDoc('aadhar', this)">
                 </label>
                 <button onclick="removeTypedDoc('aadhar')" class="px-2.5 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 text-[9px] font-bold rounded-lg transition-all">Remove</button>
                 <button onclick="previewTypedDoc('aadhar')" class="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[9px] font-bold rounded-lg transition-all">View</button>
@@ -838,11 +838,11 @@
                 <span class="text-red-500">*</span> 10th DMC (Marksheet)
               </label>
               <div id="doc-status-tenthDmc" class="text-[10px] text-slate-400 italic">Not uploaded</div>
-              <span class="text-[9px] text-gray-400 font-semibold">PDF only &middot; max 200 KB</span>
+              <span class="text-[9px] text-gray-400 font-semibold">JPG/PNG &middot; max 200 KB</span>
               <div class="flex gap-1.5 mt-1">
                 <label class="px-2.5 py-1.5 bg-[#501537] hover:bg-[#c5a059] text-white text-[9px] font-bold uppercase rounded-lg cursor-pointer transition-all">
                   Choose File
-                  <input type="file" accept="application/pdf,.pdf" class="hidden" onchange="uploadTypedDoc('tenthDmc', this)">
+                  <input type="file" accept="image/jpeg,image/jpg,image/png,.jpg,.jpeg,.png" class="hidden" onchange="uploadTypedDoc('tenthDmc', this)">
                 </label>
                 <button onclick="removeTypedDoc('tenthDmc')" class="px-2.5 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 text-[9px] font-bold rounded-lg transition-all">Remove</button>
                 <button onclick="previewTypedDoc('tenthDmc')" class="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[9px] font-bold rounded-lg transition-all">View</button>
@@ -854,11 +854,11 @@
                 <span class="text-red-500">*</span> 12th DMC (Marksheet)
               </label>
               <div id="doc-status-twelfthDmc" class="text-[10px] text-slate-400 italic">Not uploaded</div>
-              <span class="text-[9px] text-gray-400 font-semibold">PDF only &middot; max 200 KB</span>
+              <span class="text-[9px] text-gray-400 font-semibold">JPG/PNG &middot; max 200 KB</span>
               <div class="flex gap-1.5 mt-1">
                 <label class="px-2.5 py-1.5 bg-[#501537] hover:bg-[#c5a059] text-white text-[9px] font-bold uppercase rounded-lg cursor-pointer transition-all">
                   Choose File
-                  <input type="file" accept="application/pdf,.pdf" class="hidden" onchange="uploadTypedDoc('twelfthDmc', this)">
+                  <input type="file" accept="image/jpeg,image/jpg,image/png,.jpg,.jpeg,.png" class="hidden" onchange="uploadTypedDoc('twelfthDmc', this)">
                 </label>
                 <button onclick="removeTypedDoc('twelfthDmc')" class="px-2.5 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 text-[9px] font-bold rounded-lg transition-all">Remove</button>
                 <button onclick="previewTypedDoc('twelfthDmc')" class="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[9px] font-bold rounded-lg transition-all">View</button>
@@ -870,11 +870,11 @@
                 Graduation (If Have)
               </label>
               <div id="doc-status-graduation" class="text-[10px] text-slate-400 italic">Not uploaded</div>
-              <span class="text-[9px] text-gray-400 font-semibold">PDF only &middot; max 200 KB</span>
+              <span class="text-[9px] text-gray-400 font-semibold">JPG/PNG &middot; max 200 KB</span>
               <div class="flex gap-1.5 mt-1">
                 <label class="px-2.5 py-1.5 bg-[#501537] hover:bg-[#c5a059] text-white text-[9px] font-bold uppercase rounded-lg cursor-pointer transition-all">
                   Choose File
-                  <input type="file" accept="application/pdf,.pdf" class="hidden" onchange="uploadTypedDoc('graduation', this)">
+                  <input type="file" accept="image/jpeg,image/jpg,image/png,.jpg,.jpeg,.png" class="hidden" onchange="uploadTypedDoc('graduation', this)">
                 </label>
                 <button onclick="removeTypedDoc('graduation')" class="px-2.5 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 text-[9px] font-bold rounded-lg transition-all">Remove</button>
                 <button onclick="previewTypedDoc('graduation')" class="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[9px] font-bold rounded-lg transition-all">View</button>
